@@ -3,6 +3,9 @@ venv/
 backups/
 human_data/
 
+ngc-cli.md5
+ngccli_linux.zip
+
 *.pkl
 *.env
 .env

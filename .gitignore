@@ -5,6 +5,9 @@ human_data/
 
 ngc-cli.md5
 ngccli_linux.zip
+nemo-microservices-quickstart_v25.11/
+
+.vscode/
 
 *.pkl
 *.env

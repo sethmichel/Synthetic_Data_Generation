@@ -19,28 +19,16 @@ from pathlib import Path
 import sys
 
 
-# 1: get hugging face api key
-secrets_dir = Path("../secrets")
-api_key_file = secrets_dir / "hugging-face-write-token-data-generation"
-if not api_key_file.exists():
-    print(f"Error: hugging face API key file not found in {secrets_dir}")
-    sys.exit(1)
-try:
-    HF_TOKEN = api_key_file.read_text().strip()
-except Exception as e:
-    print(f"Error reading API key file: {e}")
-    sys.exit(1)
 
-# 2: misc configs
-if (System_Startup() == False):
-    sys.exit(1)
 
+# misc configs
+System_Startup()
 Clean_Seed_Data()
     
 prod_level = MODE_CONFIGS['development']
 data_designer = DataDesigner()
 config = dd.DataDesignerConfigBuilder()
-hf_api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=HF_TOKEN)
+hf_api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=os.environ["HUGGINGFACE_API_KEY"])
 HF_ENDPOINT=f"{os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"]}/v1/hf"
 
 seed_dataset_path = "human_data/edited_bulk_summary.csv"

@@ -6,6 +6,7 @@ import zipfile
 import urllib.request
 from pathlib import Path
 import random
+import sys
 from nemo_microservices import NeMoMicroservices
 
 
@@ -43,35 +44,22 @@ def System_Startup():
     """
     print("Starting System Startup...")
 
-    # 1. Load API Key
-    secrets_dir = Path("../secrets")
-    api_key_file = secrets_dir / "nvidia_ngc_api_key.txt"
-        
-    if not api_key_file.exists():
-        print(f"Error: API key file not found in {secrets_dir}")
-        return False
+    # 1. Load API Keys
+    os.environ["HUGGINGFACE_API_KEY"] = Get_Huggingface_Api_Token()
+    
+    # Key 2: NVIDIA NIM/Build Key (starts with nvapi-) for using models endpoints
+    # Renaming to NIM_API_KEY to match what Docker expects
+    os.environ["NIM_API_KEY"] = Get_NIM_Api_Token()
 
-    # Read and validate key
-    try:
-        api_key = api_key_file.read_text().strip()
-
-    except Exception as e:
-        print(f"Error reading API key file: {e}")
-        return False
-
-    # If the key doesn't start with nvapi-, fail the startup
-    if not api_key.startswith("nvapi-"):
-        print("Error: API key is likely wrong, we expect it to start with 'nvapi-'")
-        return False
+    # Also set NVIDIA_API_KEY for the Data Designer SDK (SDK requires this specific name - it's hardcoded)
+    os.environ["NVIDIA_API_KEY"] = os.environ["NIM_API_KEY"]
+    
+    # Key 3: NGC Personal Key for Docker/CLI access
+    os.environ["NGC_PERSONAL_API_KEY"] = Get_NGC_Personal_Api_Token()
+    # Set NGC_CLI_API_KEY for ngc cli tool if it uses it
+    os.environ["NGC_CLI_API_KEY"] = os.environ["NGC_PERSONAL_API_KEY"]
 
     # Set env vars for NGC CLI and Docker Compose
-    os.environ["NGC_CLI_API_KEY"] = api_key
-    #os.environ["NGC_CLI_FORMAT_TYPE"] = "json"
-
-    # Set default NeMo microservices URLs if not already set
-    # Note: The NeMo Microservices Quickstart (Docker Compose) typically runs an API Gateway on port 8080.
-    # This Gateway routes traffic to individual services (Entity Store, Data Store, etc.) based on the URL path.
-    # Therefore, pointing multiple base URLs to localhost:8080 is usually correct.
     if "NEMO_MICROSERVICES_BASE_URL" not in os.environ:
         os.environ["NEMO_MICROSERVICES_BASE_URL"] = "http://localhost:8080"
     
@@ -81,13 +69,90 @@ def System_Startup():
     if ("ENTITY_STORE_BASE_URL" not in os.environ):
         os.environ["ENTITY_STORE_BASE_URL"] = "http://localhost:8080"
     
-    # 2. Docker Login
+    # 2. Docker Login and ngc cli check
+    Start_Docker()
+
+    # 3. basic namespace and project handling
+    Create_Namespace('data')
+
+
+    return True
+
+def Get_Huggingface_Api_Token():
+    secrets_dir = Path("../secrets")
+    api_key_file = secrets_dir / "hugging-face-write-token-data-generation.txt"
+    if not api_key_file.exists():
+        print(f"Error: hugging face API key file not found in {secrets_dir}")
+        sys.exit(1)
+
+    try:
+        HF_TOKEN = api_key_file.read_text().strip()
+        return HF_TOKEN
+
+    except Exception as e:
+        print(f"Error reading API key file: {e}")
+        sys.exit(1)
+
+
+def Get_NIM_Api_Token():
+    """
+    Key 2: From build.nvidia.com, starts with 'nvapi-'.
+    Used for calling NIM endpoints (so it calls llm endpoints)
+    """
+    secrets_dir = Path("../secrets")
+    api_key_file = secrets_dir / "nvidia build api key.txt"
+        
+    if not api_key_file.exists():
+        print(f"Error: NIM API key file not found in {secrets_dir}")
+        sys.exit(1)
+
+    # Read and validate key
+    try:
+        NIM_TOKEN = api_key_file.read_text().strip()
+
+    except Exception as e:
+        print(f"Error reading NIM API key file: {e}")
+        sys.exit(1)
+
+    # If the key doesn't start with nvapi-, fail the startup
+    if not NIM_TOKEN.startswith("nvapi-"):
+        print("Error: NIM API key is likely wrong, we expect it to start with 'nvapi-'")
+        sys.exit(1)
+
+    return NIM_TOKEN
+
+
+def Get_NGC_Personal_Api_Token():
+    """
+    Key 3: From org.ngc.nvidia.com/setup.
+    Used for Docker login and NGC CLI.
+    """
+    secrets_dir = Path("../secrets")
+    api_key_file = secrets_dir / "nvidia_ngc_api_key.txt"
+        
+    if not api_key_file.exists():
+        print(f"Error: NGC Personal API key file not found in {secrets_dir}")
+        sys.exit(1)
+
+    # Read key
+    try:
+        NGC_TOKEN = api_key_file.read_text().strip()
+        return NGC_TOKEN
+
+    except Exception as e:
+        print(f"Error reading NGC Personal API key file: {e}")
+        sys.exit(1)
+
+
+def Start_Docker():
     print("Logging into NVIDIA Container Registry...")
+
     try:
         # docker login nvcr.io -u '$oauthtoken' --password-stdin
+        # Use NGC_PERSONAL_API_KEY for registry login
         subprocess.run(
             ["docker", "login", "nvcr.io", "-u", "$oauthtoken", "--password-stdin"],
-            input=api_key.encode(),
+            input=os.environ["NGC_PERSONAL_API_KEY"].encode(),
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
@@ -96,9 +161,9 @@ def System_Startup():
 
     except subprocess.CalledProcessError as e:
         print(f"Docker login failed: {e.stderr.decode()}")
-        return False
+        sys.exit(1)
     
-    # 3. Check NGC CLI
+    # Check NGC CLI
     ngc_cmd = shutil.which("ngc")
     if not ngc_cmd:
         # Check local installation
@@ -108,22 +173,11 @@ def System_Startup():
             ngc_cmd = str(possible_binary.absolute())
         else:
             print("NGC CLI not found")
-            return False
+            sys.exit(1)
     else:
         print(f"Found NGC CLI at {ngc_cmd}")
 
-
-    if (Start_Docker(ngc_cmd, api_key) == False):
-        return False
-
-    Create_Namespace('data')
-
-
-    return True
-
-
-def Start_Docker(ngc_cmd, api_key):
-    # 4. Download Quickstart Resource
+    # Download Quickstart Resource
     # Try 25.01 first as requested, fallback to 25.12 if needed
     versions_to_try = ["25.11", "25.12"]
     target_dir = None
@@ -155,16 +209,17 @@ def Start_Docker(ngc_cmd, api_key):
             
     if not target_dir or not target_dir.exists():
         print("Error: Failed to download or locate NeMo microservices quickstart.")
-        return False
+        sys.exit(1)
 
-    # 5. Start Docker Compose
+    # Start Docker Compose
     print(f"Starting services in {target_dir}...")
     
     # Configure environment for Docker Compose
     # These override defaults in the .env file if present
     env = os.environ.copy()
     env["NEMO_MICROSERVICES_IMAGE_REGISTRY"] = "nvcr.io/nvidia/nemo-microservices"
-    env["NIM_API_KEY"] = api_key
+    # Ensure NIM_API_KEY is passed to docker-compose (it expects this exact name)
+    env["NIM_API_KEY"] = os.environ["NIM_API_KEY"]
     # NEMO_MICROSERVICES_IMAGE_TAG is already set in os.environ above if we downloaded
     if "NEMO_MICROSERVICES_IMAGE_TAG" not in env:
         env["NEMO_MICROSERVICES_IMAGE_TAG"] = target_dir.name.split("_v")[-1]
@@ -182,7 +237,7 @@ def Start_Docker(ngc_cmd, api_key):
 
     except subprocess.CalledProcessError as e:
         print(f"Failed to start services: {e}")
-        return False
+        sys.exit(1)
 
 
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/create-namespace.html
@@ -197,6 +252,7 @@ def Create_Namespace(namespace_to_make):
 
     return response
 
+
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/update-namespace.html
 def Update_Namespace(namespace_to_edit):
     client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
@@ -209,6 +265,7 @@ def Update_Namespace(namespace_to_edit):
 
     print(f"edited namespace {namespace_to_edit}: {response}")
 
+
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/get-namespace.html
 def Get_Single_Namespace(namespace_to_get):
     client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
@@ -218,6 +275,7 @@ def Get_Single_Namespace(namespace_to_get):
     )
 
     return response
+
 
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/list-namespaces.html
 def Get_All_Namespaces():
@@ -305,5 +363,3 @@ def Clean_Seed_Data():
 
                 writer.writerow(filtered_row)
 
-if __name__ == "__main__":
-    System_Startup()

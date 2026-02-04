@@ -222,7 +222,8 @@ Next, we add columns
 - 
 
 
-
+TODO: do I make 1 namespace with 1 project, or do I separate them?
+TODO: might need to limit ram useage soemhow. 90% of my ram is used when the docker containers run
 
 
 

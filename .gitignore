@@ -2,6 +2,7 @@
 venv/
 backups/
 human_data/
+secrets/
 
 ngc-cli.md5
 ngccli_linux.zip

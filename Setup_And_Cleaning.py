@@ -4,6 +4,8 @@ import subprocess
 import shutil
 import zipfile
 import urllib.request
+import urllib.error
+import time
 from pathlib import Path
 import random
 import sys
@@ -37,7 +39,34 @@ MODE_CONFIGS = {
 
 
 # after running this you should have nemo microservice docker container up
-def System_Startup():
+# this stops us from editing the containers before they're fully ready
+def WaitForService(url, timeout=300):
+    print(f"Waiting for service at {url} to become available...")
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            print("Service is up!")
+            return True
+
+        except urllib.error.HTTPError:
+            print("Service is up (HTTP response)!")
+            return True
+
+        except urllib.error.URLError:
+            pass
+
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+    print("Error: Service failed to start.")
+    sys.exit(1)
+
+
+def System_Startup(NAMESPACE, PROJECT):
     """
     Launches the NVIDIA NeMo Data Designer using Docker Compose.
     Handles NGC CLI installation and resource downloading if needed.
@@ -73,10 +102,12 @@ def System_Startup():
     Start_Docker()
 
     # 3. basic namespace and project handling
-    Create_Namespace('data')
-
+    WaitForService(os.environ["ENTITY_STORE_BASE_URL"])
+    Create_Namespace(NAMESPACE)
+    Create_Project(PROJECT, 'my only project', NAMESPACE)
 
     return True
+
 
 def Get_Huggingface_Api_Token():
     secrets_dir = Path("../secrets")
@@ -242,15 +273,19 @@ def Start_Docker():
 
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/create-namespace.html
 def Create_Namespace(namespace_to_make):
-    client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
+    # Check if namespace already exists
+    result = Get_Single_Namespace(namespace_to_make)
+    if type(result) != bool:
+            print(f"Namespace '{namespace_to_make}' already exists. Skipping creation.")
+            return result
 
-    response = client.namespaces.create(
-    id=namespace_to_make
-    )
+    else:
+        client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
 
-    print(f"created namespace {namespace_to_make}: {response}") # id is response['id']
-
-    return response
+        response = client.namespaces.create(id=namespace_to_make)
+        print(f"created namespace {namespace_to_make}: {response}") # id is response['id']
+        
+        return response
 
 
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/update-namespace.html
@@ -268,11 +303,16 @@ def Update_Namespace(namespace_to_edit):
 
 # https://docs.nvidia.com/nemo/microservices/latest/manage-entities/namespaces/get-namespace.html
 def Get_Single_Namespace(namespace_to_get):
-    client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
+    try:
+        client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
 
-    response = client.namespaces.retrieve(
-        namespace_id=namespace_to_get,
-    )
+        response = client.namespaces.retrieve(
+            namespace_id=namespace_to_get,
+        )
+
+    except Exception as e:
+        print(f"Failed to get namespace, maybe it doesn't exist yet? {namespace_to_get}: {e}")
+        return False
 
     return response
 
@@ -284,10 +324,77 @@ def Get_All_Namespaces():
     return client.namespaces.list()
 
 
+def Create_Project(project_to_make, project_description, project_namespace):
+    client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
+
+    result = Get_Project(project_to_make, project_namespace)
+    if (type(result) != bool):
+        # project already exists
+        return result
+    
+    else:
+        response = client.projects.create(
+            name=project_to_make,
+            description=project_description,
+            namespace=project_namespace,
+            custom_fields={
+                "team": "default",
+                "priority": "default",
+                "status": "default",
+                "target_completion": "default",
+            },
+            ownership={
+                "created_by": "default", 
+                "access_policies": {}},
+        )
+        
+        return response
 
 
+# https://docs.nvidia.com/nemo/microservices/latest/manage-entities/projects/get-project.html
+def Get_Project(project_to_get, namespace_to_get):
+    client = NeMoMicroservices(base_url=os.environ["ENTITY_STORE_BASE_URL"])
 
+    try:
+        response = client.projects.retrieve(
+            namespace=namespace_to_get,
+            project_name=project_to_get,
+        )
+        return response
+
+    except Exception as e:
+        print(f"could not get project {project_to_get}: {e}")
+        return False
+
+
+def Load_Secrets():
+    secrets_path = Path("secrets/secrets.txt")
+    secrets = {}
+
+    if secrets_path.exists():
+        with open(secrets_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    secrets[key] = value
+
+    HF_USERNAME = secrets.get("HF_USERNAME")
+    HF_REPO_NAME = secrets.get("HF_REPO_NAME")
+
+    if not HF_USERNAME or not HF_REPO_NAME:
+        raise ValueError("HF_USERNAME or HF_REPO_NAME not found in secrets/secrets.txt")
+
+    return (HF_USERNAME, HF_REPO_NAME)
+
+
+# split data into training, testing, validation
 def Split_Dataset(seed_file_path, output_base_dir="human_data/splits"):
+    output_base = Path(output_base_dir)
+    if output_base.exists() and (output_base / "training").exists():
+        print(f"Dataset splits already exist in {output_base_dir}. Skipping split.")
+        return
+
     print(f"Splitting dataset from {seed_file_path}...")
     
     # Read the data

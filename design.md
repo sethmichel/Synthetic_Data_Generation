@@ -229,3 +229,35 @@ TODO: might need to limit ram useage soemhow. 90% of my ram is used when the doc
 
 misc notes
 - when it says docker compose, that's fine, compose is a plugin you should already have
+
+
+
+I'm here: https://docs.nvidia.com/nemo/microservices/latest/design-synthetic-data-from-scratch-or-seeds/tutorials/index.html
+ on this doc
+https://github.com/NVIDIA/GenerativeAIExamples/blob/main/nemo/NeMo-Data-Designer/self-hosted-tutorials/getting-started/1-the-basics.ipynb
+
+
+I need to tell the config_builder to use my hugging face datasets, and reference the data via the datadesigner client
+
+**regarding adding columns to models**
+example
+    config_builder.add_column(LLMTextColumnConfig(
+        name="trade_analysis",
+        # The {{ ticker }} and {{ open_price }} must match your CSV headers exactly
+        prompt="Analyze the trading volume for {{ ticker }} opening at ${{ open_price }}. Is this high volume?",
+        model_alias="main-model"
+    ))
+question: I need it to generate synthetic data of all columns, like double my dataset size. I don't understand how your analysis_column comes into play in regard to generating what the Atr14 financial value should be for ticker x at 6:35am
+
+I'm thinking of tabular data augmentation (making the csv longer by adding more rows). this is about data enrichment though (spreadsheet wider by adding new columns). to add more rows I'd have to trick nemo by treating my existing rows as templates. To make a new row, I don't create a separate config for each column -> that would lead to a disjoined mess where variables don't correlate. 
+
+Instead I make 1 output column (synthetic_row_json) and ask teh llm to generate a json obj containing all data points at once
+	so for each row, I do "Here is a real trade: {{ ticker }} at {{ time }} for {{ price }}. Create a NEW hypothetical trade that is similar but distinct. Output the result as JSON." then it returns: {"ticker": "NVDA", "time": "9:35 AM", "price": "105.50", "atr14": "1.2"}
+	- this means the llm is guessing the other columns unless I add those columns to the prompt. 
+	- let's say I want atr14 to be exscpecially accurate
+		- option 1: pass atr14 to the prompt and say like "generate a new trade where atr14 is slightly higher", then the llm will give me a number that looks like an atr14 but it's still mathmatically perfect
+		- option 2: I use the llm to generate the human or market elements (price, volumn, time) and then I recaluate teh technical indicators myself. llm's are bad at floating point math.
+	- is this the correct approach? yes
+
+what I need to do is genrate the core data via llm's, then do the technicals myself even. it's impossible to mimic tos's numbers but I can get close enough for this purpose.
+

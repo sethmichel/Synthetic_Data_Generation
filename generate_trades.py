@@ -3,43 +3,68 @@ from data_designer.interface import DataDesigner
 from nemo_microservices.data_designer.essentials import (
     DataDesignerConfigBuilder,
     NeMoDataDesignerClient,
+    LLMTextColumnConfig
 )
 from nemo_microservices import NeMoMicroservices
 from huggingface_hub import HfApi
 import Setup_And_Cleaning
+from Models import model_configs
 import os
 import csv
+import json
 import requests
 from pathlib import Path
 import sys
+import pandas as pd
+import time
 
 
 
 
 # misc configs
+prod_level = Setup_And_Cleaning.MODE_CONFIGS['development']
 NAMESPACE="data"
 PROJECT="stock-trade-data-generation"
-Setup_And_Cleaning.System_Startup(NAMESPACE, PROJECT)
-Setup_And_Cleaning.Clean_Seed_Data()
-    
-prod_level = Setup_And_Cleaning.MODE_CONFIGS['development']
+seed_dataset_path = "data/human_data/edited_bulk_summary.csv"
+
 data_designer = DataDesigner()
-config = dd.DataDesignerConfigBuilder()
-hf_api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])
-# To use local NeMo Data Store instead, uncomment these lines:
+config_builder = dd.DataDesignerConfigBuilder()
+data_designer_client = NeMoDataDesignerClient(base_url=os.environ["NEMO_MICROSERVICES_BASE_URL"])
+
+# preprocessing / setup
+Setup_And_Cleaning.System_Startup(NAMESPACE, PROJECT)
+hf_api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])  # this is remote hf
+HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()
+HF_REPO_ID = f"{HF_USERNAME}/{HF_REPO_NAME}"
+# these 2 lines are for local hf
 # hf_api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=os.environ["HUGGINGFACE_API_KEY"])
 # HF_ENDPOINT=f"{os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"]}/v1/hf"
 
-seed_dataset_path = "human_data/edited_bulk_summary.csv"
-HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()
-HF_REPO_ID = f"{HF_USERNAME}/{HF_REPO_NAME}"
-data_designer_client = NeMoDataDesignerClient(base_url=os.environ["NEMO_MICROSERVICES_BASE_URL"])
-
 
 # send post request of our dataset to the entity store
+# this does the same thing as NeMoDataDesignerClient.upload_seed_dataset
 def Send_Seed_To_EntityStore():
+    dataset_name = "seed_trades"
+
+    try:
+        # grab all the datasets via the hf_api and look for a dataset with the same name as dataset_name
+        datasets = list(hf_api.list_datasets(search=dataset_name))
+        
+        for dataset in datasets:
+             if dataset_name in dataset.id:
+                print(f"Dataset '{dataset_name}' already exists (ID: {dataset.id}).")
+                user_response = input("Do you want to overwrite it? (y/n): ").strip().lower()
+                
+                if user_response != 'y':
+                    print("Skipping dataset upload.")
+                    return dataset
+                break
+
+    except Exception as e:
+        print(f"Error checking for existing dataset: {e}")
+
     dataset_info = {
-        'name': "seed_trades", # Matching the dataset name from repo_id
+        'name': dataset_name, # Matching the dataset name from repo_id
         'namespace': NAMESPACE,
         'description': "human-made-stock-trades",
         'format': 'csv',
@@ -62,10 +87,7 @@ def Send_Seed_To_EntityStore():
     )
     response_data = response.json()
     
-    return {
-        "dataset_id": response_data.get("id"),
-        "dataset_info": response_data
-    }
+    return dataset
 
 
 # send files to that repo in hf (training, testing, validation, complete set)
@@ -120,7 +142,7 @@ def Send_Dataset_Files_HF(repo_id):
     try:
         # training
         hf_api.upload_folder(
-            folder_path="human_data/splits/training",
+            folder_path="data/human_data/splits/training",
             path_in_repo="training",
             repo_id=repo_id,
             repo_type="dataset"
@@ -128,7 +150,7 @@ def Send_Dataset_Files_HF(repo_id):
         
         # validation
         hf_api.upload_folder(
-            folder_path="human_data/splits/validation",
+            folder_path="data/human_data/splits/validation",
             path_in_repo="validation",
             repo_id=repo_id,
             repo_type="dataset"
@@ -136,7 +158,7 @@ def Send_Dataset_Files_HF(repo_id):
         
         # testing
         hf_api.upload_folder(
-            folder_path="human_data/splits/testing",
+            folder_path="data/human_data/splits/testing",
             path_in_repo="testing",
             repo_id=repo_id,
             repo_type="dataset"
@@ -144,7 +166,7 @@ def Send_Dataset_Files_HF(repo_id):
 
         # complete_set
         hf_api.upload_file(
-            path_or_fileobj="human_data/edited_bulk_summary.csv",
+            path_or_fileobj="data/human_data/edited_bulk_summary.csv",
             path_in_repo="complete_set/edited_bulk_summary.csv",
             repo_id=repo_id,
             repo_type="dataset"
@@ -156,24 +178,134 @@ def Send_Dataset_Files_HF(repo_id):
         print(f"Error uploading files: {e}")
 
 
+# sampling_strategy controls how the data designer reads the data. so it's not redundant to how we uploaded train/test datasets already
+def Connect_Data_To_Nemo(seed_dataset):
+    # link the dataset we're using to this job
+    # ordered:  reads rows in order
+    # shuffled: does all rows but in random order
+    config_builder.with_seed_dataset(
+        dataset_reference=seed_dataset,
+        sampling_strategy="shuffle" # or "ordered"
+    )
 
 
+# we don't map columns in a basic sense, we're referenceing them inside prompts via jinja2 prompts
+# kinda complex. see design.md
+# basically we need to generate the core data, have the llm generate 1 new column of json data, then make a row based on that json
+def Map_Columns_To_Models():
+    '''
+    These are all the columns in the edited csv: 
+        Ticker,Entry Time,Entry Price,Exit Price,Trade Type,Worst Exit Percent,Trade Best Exit Percent,Trade Percent Change,Entry Volatility Percent
+    '''
+    config_builder.add_column(LLMTextColumnConfig(
+        name="new_synthetic_trade_json", 
+        
+        # PASS EVERY RELEVANT COLUMN HERE so the LLM has the full statistical picture (not technical indicators)
+        prompt=f"""
+        You are a financial data simulation engine.
+
+        Reference Trade Context:
+        - Ticker: {{ ticker }}
+        - Entry Time: {{ entry_time }}
+        - Entry Price: {{ entry_price }}
+        - Trade Type: {{ trade_type }}
+        - Worst Exit Percent: {{ worst_exit_percent }}
+        - Trade Best Exit Percent: {{ trade_best_exit_percent }}
+        - Entry Volatility Percent: {{ entry_volatility_percent }}
+        
+        Task:
+        Create a SYNTHETIC trade record that represents a plausible alternative scenario for this specific stock at this specific time.
+        
+        Rules:
+        1. Perturb the Entry Time/Entry Price metrics by a small random factor (0.5% - 1.5%) consistent with the volatility indicated by the 'Volatility Percent'.
+        2. Adjust 'Volatility Percent' by +/- 10%.
+        3. Keep the Ticker the same.
+        
+        Output strictly valid JSON.
+        """,
+        model_alias="generator-model"
+    ))
 
 
+def Run_Generator_Model():
+    output_file_name = "data/human_data/Raw_Generator_Model_Results.csv"
 
-dataset_result = Send_Seed_To_EntityStore()
-dataset_id = dataset_result["dataset_id"]
+    print("Starting generation job...")
+    job = data_designer_client.create_job(config_builder)
+    print(f"Job ID: {job.id}")
 
-Setup_And_Cleaning.Split_Dataset(seed_dataset_path)   # Split the single seed dataset into training/validation/testing folders
-Send_Dataset_Files_HF(HF_REPO_ID)  # upload to hf
+    while not job.is_done():
+        time.sleep(5)
+        job.refresh()
+
+    print("Job Complete!")
+
+    results_df = data_designer_client.download_dataset(job.id)  # returns a df with the new json column
+    results_df.to_csv(output_file_name, index = False)
+    print(f"saved raw generator results to {output_file_name}")
+
+    return results_df
 
 
+# generator model returns a dataframe that's the same as the original, but it has 1 new column called "new_synthetic_trade_json"
+#     which is a json of the new data. it will only have valid core data, the rest is random numbers we'll need to caluclate later
+def Unpack_Synthetic_Data(results_df):
+    dest_path = "data/synthetic_data/generator_results.csv"
+    
+    new_rows = []
+    
+    print("Unpacking synthetic trades...")
+    for index, row in results_df.iterrows():
+        try:
+            json_content = row['new_synthetic_trade_json']
+            
+            # Clean markdown if present
+            if isinstance(json_content, str):
+                clean_json = json_content.strip()
+                if clean_json.startswith('```json'):
+                    clean_json = clean_json[7:]
+                if clean_json.startswith('```'):
+                    clean_json = clean_json[3:]
+                if clean_json.endswith('```'):
+                    clean_json = clean_json[:-3]
+                
+                trade_data = json.loads(clean_json.strip())
+                new_rows.append(trade_data)
+                
+        except Exception as e:
+            print(f"Error parsing JSON at index {index}: {e}")
+            continue
+            
+    if new_rows:
+        new_df = pd.DataFrame(new_rows)
+        # Append new rows to the dataframe
+        results_df = pd.concat([results_df, new_df], ignore_index=True)
+        
+    # Save with timestamp
+    filename = dest_path.split('/')[-1]
+    name_parts = filename.split('.')
+    timestamp = int(time.time())
+    new_filename = f"{name_parts[0]}_{timestamp}.{name_parts[1]}"
+    
+    output_dir = os.path.dirname(dest_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        
+    final_path = os.path.join(output_dir, new_filename)
+    results_df.to_csv(final_path, index=False)
 
+    print(f"Saved unpacked data to {final_path}")
 
+    
 
+Setup_And_Cleaning.Clean_Seed_Data()       # clean the dataset
+seed_dataset = Send_Seed_To_EntityStore()  # send dataset to entity store
+seed_dataset_id = seed_dataset.id          # get dataset id
 
+Setup_And_Cleaning.Split_Dataset(seed_dataset_path)  # Split the single seed dataset into training/validation/testing folders
+Send_Dataset_Files_HF(HF_REPO_ID)                    # upload to hf
+Connect_Data_To_Nemo(seed_dataset)                       
+Map_Columns_To_Models()                              # give the models their prompts
+results_df = Run_Generator_Model()                   # run generator model
 
-# 4. Preview the Result
-print("Generating a preview...")
-preview = data_designer.preview(config_builder=config)
-print(preview.display_sample_record())
+Unpack_Synthetic_Data(results_df)                    # process the generator model results

@@ -389,7 +389,7 @@ def Load_Secrets():
 
 
 # split data into training, testing, validation
-def Split_Dataset(seed_file_path, output_base_dir="human_data/splits"):
+def Split_Dataset(seed_file_path, output_base_dir="data/human_data/splits"):
     output_base = Path(output_base_dir)
     if output_base.exists() and (output_base / "training").exists():
         print(f"Dataset splits already exist in {output_base_dir}. Skipping split.")
@@ -439,16 +439,19 @@ def Split_Dataset(seed_file_path, output_base_dir="human_data/splits"):
     print(f"Dataset split completed. Files saved to {output_base_dir}")
 
 
+# filter out unusable data
 def Clean_Seed_Data():
-    seed_dataset_path = "human_data/original_bulk_summaries.csv"
+    seed_dataset_path = "data/human_data/original_bulk_summaries.csv"
     dest_file_name = "edited_bulk_summary.csv"
-    dest_path = os.path.join("human_data", dest_file_name)
+    dest_path = os.path.join("data/human_data", dest_file_name)
     
-    if not os.path.exists(dest_path):  
-        columns_to_remove = ["Trade Id", "Dollar Change", "Running Percent By Ticker", "Running Percent All", "Total Investment", 
+    if not os.path.exists(dest_path):
+        columns_to_remove = ['Date',"Trade Id", "Exit Time", "Dollar Change", "Running Percent By Ticker", "Running Percent All", "Total Investment", 
                             "Entry Price", "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
-                            "Worst Exit Time In Trade", "Trade Holding Reached"]
-                            
+                            "Worst Exit Time In Trade", "Trade Holding Reached", 'Time in Trade',
+                            'Entry Atr14','Entry Atr28','Entry Volatility Ratio','Entry Adx28','Entry Adx14',
+                            'Entry Adx7']
+
         with open(seed_dataset_path, 'r', encoding='utf-8') as f_in, open(dest_path, 'w', newline='', encoding='utf-8') as f_out:
             reader = csv.DictReader(f_in)
 

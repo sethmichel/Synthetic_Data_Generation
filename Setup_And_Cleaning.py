@@ -11,29 +11,35 @@ import random
 import sys
 from nemo_microservices import NeMoMicroservices
 
+'''
+models
+mistral-nemo-minitron-8b-base: https://build.nvidia.com/nvidia/mistral-nemo-minitron-8b-base/modelcard
+'''
+
+
 
 # 1: config the models
 MODE_CONFIGS = {
     # use tiny model with timeouts
     "development": {
-        "generator_model": "",
-        "judge_model": "meta/llama-3.1-8b-instruct",
+        "generator_model": "nvidia/mistral-nemo-minitron-8b-base",
+        "judge_model": "",
         "timeout": 30,
-        "max_tokens": 1024
+        "max_tokens": 512
     },
     # use mid model
     "mini_prod": {
         "generator_model": "",
-        "judge_model": "meta/llama-3.1-70b-instruct",
+        "judge_model": "",
         "timeout": 60,
-        "max_tokens": 1024
+        "max_tokens": 512
     },
     # use only if I'm looking for final results
     "full_prod": {
         "generator_model": "",
-        "judge_model": "meta/llama-3.1-405b-instruct",
+        "judge_model": "",
         "timeout": 120,
-        "max_tokens": 2048
+        "max_tokens": 512
     }
 }
 
@@ -175,6 +181,52 @@ def Get_NGC_Personal_Api_Token():
         sys.exit(1)
 
 
+def Fix_Docker_Volume_Issue(target_dir, env):
+    """
+    Checks if the docker container failed due to PID file corruption 
+    and fixes it by resetting the volume.
+    """
+    print("Checking for known Docker volume corruption issue...")
+    
+    try:
+        # Check logs of the docker-in-docker container
+        # We use check=False so we don't crash if the container doesn't exist or logs fail
+        res = subprocess.run(
+            ["docker", "logs", "--tail", "50", "nemo-microservices-docker-1"],
+            capture_output=True, 
+            text=True,
+            check=False
+        )
+        logs = res.stderr + res.stdout
+        
+        # Look for the specific error signature
+        # "failed to save daemon pid to disk" or "process with PID ... is still running"
+        if "failed to save daemon pid to disk" in logs or ("process with PID" in logs and "is still running" in logs):
+            print("Found corruption in nemo-microservices-docker-1 (PID file issue). Performing automatic cleanup...")
+            
+            print("Stopping services...")
+            subprocess.run(
+                ["docker", "compose", "--profile", "data-designer", "down"],
+                cwd=target_dir,
+                env=env,
+                check=True
+            )
+            
+            print("Removing corrupted volume 'nemo-microservices_docker_storage'...")
+            subprocess.run(
+                ["docker", "volume", "rm", "nemo-microservices_docker_storage"],
+                check=True
+            )
+            
+            print("Cleanup complete.")
+            return True
+            
+    except Exception as e:
+        print(f"Error during corruption check/fix: {e}")
+    
+    return False
+
+
 def Start_Docker():
     print("Logging into NVIDIA Container Registry...")
 
@@ -268,6 +320,23 @@ def Start_Docker():
 
     except subprocess.CalledProcessError as e:
         print(f"Failed to start services: {e}")
+        
+        # Try to automatically fix the known volume corruption issue
+        if Fix_Docker_Volume_Issue(target_dir, env):
+            print("Retrying service startup after cleanup...")
+            try:
+                subprocess.run(
+                    ["docker", "compose", "--profile", "data-designer", "up", "-d"],
+                    cwd=target_dir,
+                    env=env,
+                    check=True
+                )
+                print("Services started successfully on retry.")
+                print("Run 'docker ps' to verify.")
+                return # Success
+            except subprocess.CalledProcessError as e2:
+                print(f"Failed to start services even after cleanup: {e2}")
+        
         sys.exit(1)
 
 
@@ -447,7 +516,7 @@ def Clean_Seed_Data():
     
     if not os.path.exists(dest_path):
         columns_to_remove = ['Date',"Trade Id", "Exit Time", "Dollar Change", "Running Percent By Ticker", "Running Percent All", "Total Investment", 
-                            "Entry Price", "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
+                            "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
                             "Worst Exit Time In Trade", "Trade Holding Reached", 'Time in Trade',
                             'Entry Atr14','Entry Atr28','Entry Volatility Ratio','Entry Adx28','Entry Adx14',
                             'Entry Adx7']

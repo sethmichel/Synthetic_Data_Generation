@@ -261,3 +261,34 @@ Instead I make 1 output column (synthetic_row_json) and ask teh llm to generate 
 
 what I need to do is genrate the core data via llm's, then do the technicals myself even. it's impossible to mimic tos's numbers but I can get close enough for this purpose.
 
+**llm columns vs sampler columns**
+- sampler
+	- the one who provides a topic or direction for the data. no ai, it's algorithmic and picks values from a list I give
+	- these force diversity by injecting instructions into the prompt before the ai sees it
+
+- llm columns
+	- use llm's to generate new content based on a prompt. like an improve actor acting off a topic or direction
+	- ai tends to revert back to teh average, so you don't get outliers or edge cases
+
+- how to combine them
+	- if I have a column bear/bull/flat market conditions then the llm could pick bull every time. a sampler column forces distribution/diversity. I tell the sampler for every row pick 1 of 3 options, then tell the llm to use that new sample column variable
+	market_condition_sampler = SamplerColumnConfig(
+		name="market_condition",
+		data=["Bull Market", "Bear Market", "High Volatility Chopping", "Low Volatility Flat"],
+		# You can even weight them! (e.g., make Bear Markets rare)
+		# weights=[0.3, 0.1, 0.2, 0.4] 
+	)
+	then the llm column includes this
+	...
+	If {{ market_condition }} is 'Bear Market', ensure the price drops significantly.
+    If {{ market_condition }} is 'High Volatility', ensure the High/Low spread is wide.
+    ...
+
+
+**models and gpu handling**
+- my output is a small json, so max_tokens can be 512. if it's too high it might print the result muiltiple times (maybe, that seems odd to me)
+- the minstal nemo nintron 8b is low vram
+- code should prevent an infiite loop bill scenario. use a max_job_time check that kills the job
+- I'm set up to use nvidia nim (serverless api's via build.nvidia). brev nvidia is renting a linux server with dedicated gpu and pay per hour. I do this if I want to replace the api with my own self-hosted model to save tokens on massive runs. So I think this is if I can't host the system, but both cases use cloud gpu's
+- using the really low power 8b model should just work if I run the code
+- if I ran a 340b model, the same process applies, it'll just work. brev is just the infrastrurure, it's a full computer I rent by the hour. so you use it if you're running a 12 hour job and do'nt want your computer up, or if your computer can't handle the docker containers and stuff. also nim tokens are expensive at scale and thus it's cheaper to use brev

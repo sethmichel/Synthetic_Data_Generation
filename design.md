@@ -295,4 +295,23 @@ what I need to do is genrate the core data via llm's, then do the technicals mys
 
 
 
-                                   
+**MODELS**
+Generator models role: use volaility_percent as the diversity column, apply a jinja2 prompt to all rows. this generates a new column which has a json for each row. then use a function to move those jsons to their own row. this is 2x data.
+
+judge: each result from the generator llm be processed by a judge llm who passes or fails each data result. if it fails it then the generator has to try that data point again until it gets a pass.
+	- do this by making a 2nd llmtextColumn
+	- here's how to start/stop the nemo evaluator (evaluator: The service provides automated workflows for over 100 academic benchmarks, LLM-as-a-judge scoring, and specialized metrics for RAG and agent systems.) https://docs.nvidia.com/nemo/microservices/latest/evaluate/index.html
+
+
+this system uses nvidia nemo data designer to generate synthetic data of a stock trading logs. currently it handles sending the dataset to the necessary places (entity store and hugging face hub), and then using volatility_percent to diversity the data and calling a generator llm. 
+
+Now, I need a judge llm or some way to grade each result form the generator model.
+
+we're going to use nemo evaluator as the judge. you're going to need to read the docs to undertand how to do this in python. most or all the docker containers are already launched via setup_and_cleaning.py. First, evaluate if the setup of the system is correct to be able to use evaluator
+
+basic overview: https://docs.nvidia.com/nemo/microservices/latest/evaluate/index.html
+use llm as a judge: https://docs.nvidia.com/nemo/microservices/latest/evaluate/flows/llm-as-a-judge.html
+
+setup_and_cleaning.py should have the endpoint and docker commands necessary, but it's untested.
+
+I don't care about the results quality however it should more complex than soemthing like "is this valid json", I just need it to work for now, and I want python code as opposed to curl commands

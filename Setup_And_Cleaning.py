@@ -103,6 +103,9 @@ def System_Startup(NAMESPACE, PROJECT):
     
     if ("ENTITY_STORE_BASE_URL" not in os.environ):
         os.environ["ENTITY_STORE_BASE_URL"] = "http://localhost:8080"
+
+    if "EVALUATOR_BASE_URL" not in os.environ:
+        os.environ["EVALUATOR_BASE_URL"] = "http://localhost:8080"
     
     # 2. Docker Login and ngc cli check
     Start_Docker()
@@ -206,7 +209,7 @@ def Fix_Docker_Volume_Issue(target_dir, env):
             
             print("Stopping services...")
             subprocess.run(
-                ["docker", "compose", "--profile", "data-designer", "down"],
+                ["docker", "compose", "--profile", "data-designer", "--profile", "evaluator", "down"],
                 cwd=target_dir,
                 env=env,
                 check=True
@@ -308,9 +311,9 @@ def Start_Docker():
         env["NEMO_MICROSERVICES_IMAGE_TAG"] = target_dir.name.split("_v")[-1]
 
     try:
-        # docker compose --profile data-designer up -d
+        # docker compose --profile data-designer --profile evaluator up -d
         subprocess.run(
-            ["docker", "compose", "--profile", "data-designer", "up", "-d"],
+            ["docker", "compose", "--profile", "data-designer", "--profile", "evaluator", "up", "-d"],
             cwd=target_dir,
             env=env,
             check=True
@@ -326,7 +329,7 @@ def Start_Docker():
             print("Retrying service startup after cleanup...")
             try:
                 subprocess.run(
-                    ["docker", "compose", "--profile", "data-designer", "up", "-d"],
+                    ["docker", "compose", "--profile", "data-designer", "--profile", "evaluator", "up", "-d"],
                     cwd=target_dir,
                     env=env,
                     check=True
@@ -509,19 +512,17 @@ def Split_Dataset(seed_file_path, output_base_dir="data/human_data/splits"):
 
 
 # filter out unusable data
-def Clean_Seed_Data():
-    seed_dataset_path = "data/human_data/original_bulk_summaries.csv"
-    dest_file_name = "edited_bulk_summary.csv"
-    dest_path = os.path.join("data/human_data", dest_file_name)
+def Clean_Seed_Data(SEED_DATASET_PATH):
+    original_seed_dataset_path = "data/human_data/original_bulk_summaries.csv"
     
     # remove the check so we always regenerate clean data with correct headers
-    # if not os.path.exists(dest_path):
+    # if not os.path.exists(SEED_DATASET_PATH):
     columns_to_remove = ['Date',"Trade Id", "Exit Time", "Dollar Change", "Running Percent By Ticker", "Running Percent All", 
                          "Total Investment", "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
                         "Worst Exit Time In Trade", "Trade Holding Reached", 'Time in Trade','Entry Atr14','Entry Atr28',
                         'Entry Volatility Ratio','Entry Adx28','Entry Adx14','Entry Adx7']
 
-    with open(seed_dataset_path, 'r', encoding='utf-8') as f_in, open(dest_path, 'w', newline='', encoding='utf-8') as f_out:
+    with open(original_seed_dataset_path, 'r', encoding='utf-8') as f_in, open(SEED_DATASET_PATH, 'w', newline='', encoding='utf-8') as f_out:
         reader = csv.DictReader(f_in)
 
         # Filter out columns to remove AND normalize names to snake_case

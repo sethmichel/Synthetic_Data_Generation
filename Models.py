@@ -21,25 +21,51 @@ SYSTEM_PROMPT = "/no_think"
 # max_tokens: size of output. 
 #             generator: makes the json of a row which is really small. 512 should be more than enough
 #             judge: 
-model_configs = [
-    ModelConfig(
-        alias="generator-model-low",
-        model="nvidia/mistral-nemo-minitron-8b-base",
-        provider=MODEL_PROVIDER,   
-        inference_parameters=InferenceParameters(
-            temperature=0.5,
-            top_p=0.9,
-            max_tokens=512,
+
+model_hash_map = {"development": 
+    [ModelConfig(
+            alias="generator-model-development",
+            model="nvidia/mistral-nemo-minitron-8b-base",  # https://build.nvidia.com/nvidia/mistral-nemo-minitron-8b-base
+            provider=MODEL_PROVIDER,   
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
         ),
-    ),
-    ModelConfig(
-        alias="judge-model",
-        model="",
-        provider=MODEL_PROVIDER,
-        inference_parameters=InferenceParameters(
-            temperature=0.5,
-            top_p=0.9,
-            max_tokens=512,
+        ModelConfig(
+            alias="judge-model",
+            model="meta/llama-3.1-8b-instruct",  # https://build.nvidia.com/meta/llama-3_1-8b-instruct/modelcard
+                                                 # we need an instruct variant
+            provider=MODEL_PROVIDER,
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
+        )
+    ],
+    "mini_prod": [],
+    "full_prod": 
+    [ModelConfig(
+            alias="generator-model-full-prod",
+            model="nvidia/mistral-nemotron",  # https://build.nvidia.com/mistralai/mistral-nemotron/modelcard
+            provider=MODEL_PROVIDER,   
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
         ),
-    )
-]
+        ModelConfig(
+            alias="judge-model-full-prod",
+            model="nvidia/mistral-nemotron",  # https://build.nvidia.com/mistralai/mistral-nemotron/modelcard
+            provider=MODEL_PROVIDER,
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
+        )
+    ] 
+}

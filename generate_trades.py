@@ -5,55 +5,54 @@ from nemo_microservices.data_designer.essentials import (
     NeMoDataDesignerClient,
     LLMTextColumnConfig,
     SamplerColumnConfig,
-    SamplerType,
     CategorySamplerParams
 )
-from nemo_microservices.data_designer.config.seed import SeedDatasetReference, DatastoreSeedDatasetReference
+from nemo_microservices.data_designer.config.seed import DatastoreSeedDatasetReference
 from nemo_microservices import NeMoMicroservices
 from huggingface_hub import HfApi
 import Setup_And_Cleaning
-from Models import model_configs
+from Models import model_hash_map
 import os
-import csv
 import json
 import requests
-from pathlib import Path
 import sys
 import pandas as pd
 import time
 from datetime import date
-import inspect
-
-
 
 
 # misc configs
-prod_level = Setup_And_Cleaning.MODE_CONFIGS['development']
+prod_level = 'development'
+models = model_hash_map[prod_level]  # list of model config obj's at this dev level
 NAMESPACE="data"
 PROJECT="stock-trade-data-generation"
-seed_dataset_path = "data/human_data/edited_bulk_summary.csv"
+DATASET_FILE_NAME = "edited_bulk_summary.csv"
+SEED_DATASET_PATH = f"data/human_data/{DATASET_FILE_NAME}"
 
 # preprocessing / setup
 Setup_And_Cleaning.System_Startup(NAMESPACE, PROJECT)
-hf_api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])        # this is remote hf
-HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()  # my username, and repo name we're using
+huggingFace_Api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])  # this is remote hf
+HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()     # my username, and repo name we're using
 HF_REPO_ID = f"{HF_USERNAME}/{HF_REPO_NAME}"
+hf_hub_endpoint = "https://huggingface.co"
 # these 2 lines are for local hf
-# hf_api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=os.environ["HUGGINGFACE_API_KEY"])
+# huggingFace_Api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=os.environ["HUGGINGFACE_API_KEY"])
 # HF_ENDPOINT=f"{os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"]}/v1/hf"
 
+# nemo stuff
 data_designer = DataDesigner()
-config_builder = DataDesignerConfigBuilder(model_configs)
+config_builder = DataDesignerConfigBuilder(models)
 data_designer_client = NeMoDataDesignerClient(base_url=os.environ["NEMO_MICROSERVICES_BASE_URL"])
 
 # send post request of our dataset to the entity store
 # this does the same thing as NeMoDataDesignerClient.upload_seed_dataset
-def Send_Seed_To_EntityStore():
+# user can select to skip this is the data already exists there
+def Send_To_EntityStore():
     dataset_name = "seed_trades"
 
     try:
-        # grab all the datasets via the hf_api and look for a dataset with the same name as dataset_name
-        datasets = list(hf_api.list_datasets(search=dataset_name))
+        # grab all the datasets via the huggingFace_Api and look for a dataset with the same name as dataset_name
+        datasets = list(huggingFace_Api.list_datasets(search=dataset_name))
         
         for dataset in datasets:
              if dataset_name in dataset.id:
@@ -95,27 +94,28 @@ def Send_Seed_To_EntityStore():
     return dataset
     
 
-
 # send files to that repo in hf (training, testing, validation, complete set)
-def Send_Dataset_Files_HF(repo_id):
+# hugging face hub
+# user can select to skip this is the data already exists there
+def Send_To_HF(repo_id):
     # create the repo
     try:
-        if hf_api.repo_exists(repo_id=repo_id, repo_type="dataset"):
+        if huggingFace_Api.repo_exists(repo_id=repo_id, repo_type="dataset"):
             print(f"Repo {repo_id} already exists")
         else:
-            hf_api.create_repo(repo_id=repo_id, repo_type="dataset", private=True)
+            huggingFace_Api.create_repo(repo_id=repo_id, repo_type="dataset", private=True)
 
     except Exception as e:
         print(f"Error checking/creating repo: {e}")
         # Try to proceed or re-raise depending on logic, but typically we want to ensure repo exists
         try:
-             hf_api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=True)
+             huggingFace_Api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True, private=True)
         except Exception as e2:
              print(f"Could not create repo: {e2}")
 
     # if files already exist then we need user permission to overwrite them or to skip it
     try:
-        existing_files = hf_api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        existing_files = huggingFace_Api.list_repo_files(repo_id=repo_id, repo_type="dataset")
         
         files_to_upload = [
             "training/training.csv",
@@ -147,7 +147,7 @@ def Send_Dataset_Files_HF(repo_id):
     # we're doing complete_set, training, validation, testing datasets
     try:
         # training
-        hf_api.upload_folder(
+        huggingFace_Api.upload_folder(
             folder_path="data/human_data/splits/training",
             path_in_repo="training",
             repo_id=repo_id,
@@ -155,7 +155,7 @@ def Send_Dataset_Files_HF(repo_id):
         )
         
         # validation
-        hf_api.upload_folder(
+        huggingFace_Api.upload_folder(
             folder_path="data/human_data/splits/validation",
             path_in_repo="validation",
             repo_id=repo_id,
@@ -163,7 +163,7 @@ def Send_Dataset_Files_HF(repo_id):
         )
         
         # testing
-        hf_api.upload_folder(
+        huggingFace_Api.upload_folder(
             folder_path="data/human_data/splits/testing",
             path_in_repo="testing",
             repo_id=repo_id,
@@ -171,7 +171,7 @@ def Send_Dataset_Files_HF(repo_id):
         )
 
         # complete_set
-        hf_api.upload_file(
+        huggingFace_Api.upload_file(
             path_or_fileobj="data/human_data/edited_bulk_summary.csv",
             path_in_repo="complete_set/edited_bulk_summary.csv",
             repo_id=repo_id,
@@ -184,35 +184,22 @@ def Send_Dataset_Files_HF(repo_id):
         print(f"Error uploading files: {e}")
 
 
-# deprecated (leave for now)
-def Add_Models_To_Config():
-    # generator model
-    for model in model_configs:
-        if (model.model == prod_level["generator_model"]):
-            config_builder.add_model(model)
-
-
-# sampling_strategy controls how the data designer reads the data. so it's not redundant to how we uploaded 
-#       train/test datasets already
-# seed_dataset is the info returned from uploading/getting the dataset, not the actual dataset
-def Connect_Data_To_Nemo(seed_dataset, seed_dataset_id):
-    # link the dataset we're using to this job
-    # ordered:  reads rows in order
-    # shuffled: does all rows but in random order
-    
+# connect to the entity store. we should have already sent out dataset there
+# get a reference to the dataset, then connect
+def Connect_To_Entity_Store(seed_dataset_id):    
     try:
         # we need the path of the dataset in the entity store
         # list all datasets
-        print(f"Connecting to Data Store at: {hf_api}")
+        print(f"Connecting to Data Store at: {huggingFace_Api}")
 
         ''' this is for finding the dataset reference and seeing the files
         DO NOT REMOVE, it could be useful
         dataset_name = "seed_trades"
-        datasets = list(hf_api.list_datasets(search=dataset_name))
+        datasets = list(huggingFace_Api.list_datasets(search=dataset_name))
         for ds in datasets:
             if (ds.id == seed_dataset_id):
                 try:
-                    files = hf_api.list_repo_files(repo_id=ds.id, repo_type="dataset")
+                    files = huggingFace_Api.list_repo_files(repo_id=ds.id, repo_type="dataset")
 
                     for f in files:
                         print(f"   └─ File: {f}")
@@ -226,9 +213,9 @@ def Connect_Data_To_Nemo(seed_dataset, seed_dataset_id):
         # Create reference to existing dataset in the datastore
         # Since the dataset is on the remote Hugging Face Hub, we point to that endpoint.
         seed_dataset_reference = DatastoreSeedDatasetReference(
-            dataset=f"{seed_dataset_id}/complete_set/edited_bulk_summary.csv",  # TODO: hardcoded
+            dataset=f"{seed_dataset_id}/complete_set/{DATASET_FILE_NAME}",  # TODO: hardcoded
             datastore_settings={
-                "endpoint": "https://huggingface.co",
+                "endpoint": hf_hub_endpoint,
                 "token": os.environ["HUGGINGFACE_API_KEY"]
             },
         )
@@ -243,10 +230,8 @@ def Connect_Data_To_Nemo(seed_dataset, seed_dataset_id):
         sys.exit(1)
 
 
-
 # we don't map columns in a basic sense, we're referenceing them inside prompts via jinja2 prompts
-# kinda complex. see design.md
-# basically we need to generate the core data, have the llm generate 1 new column of json data, then make a row based on that json
+# control diversity (distribution of data) and make the llm prompt which applies to each dataset row
 def Map_Columns_To_Models():
     '''
     These are all the columns in the edited csv: 
@@ -305,10 +290,8 @@ def Map_Columns_To_Models():
     config_builder.add_column(synthetic_trade_generator)
     
 
-
+# TESTING VERSION (basic generation to test the code works)
 def Run_Generator_Model_PREVIEW():
-    output_file_name = "data/synthetic_data/previews/Raw_Generator_Model_Results_PREVIEW.csv"
-
     print("Starting PREVIEW generation job...")
 
     # Verification: Check that seed config is active so user knows data is present
@@ -320,22 +303,6 @@ def Run_Generator_Model_PREVIEW():
     # Fix for 422 Error: Remove seed-dataset columns from config as server might be older (just remove metadata, not actual data)
     #     and doesn't recognize them, causing validation error.
     removed_cols = {}
-    
-    # Access _column_configs directly to bypass delete restrictions
-    # NOTE: We can't just delete them because the config builder will then fail client-side validation
-    # complaining that the LLM columns reference non-existent variables (since we just deleted them).
-    
-    # STRATEGY 2: Instead of deleting them, we replace them with temporary "ExpressionColumnConfig" placeholders
-    # that simply pass through the variable (if possible) or just act as stubs so validation passes.
-    # However, since the SERVER rejects "seed-dataset" type, but the CLIENT needs them for "allowed_references",
-    # we have a dilemma.
-    
-    # If the server is rejecting the request, it's because `preview()` calls `build()` which serializes everything.
-    # The client-side validation `validate()` checks `allowed_references`.
-    
-    # Workaround: We temporarily monkey-patch the `allowed_references` property on the builder instance
-    # to include the names of the columns we are removing, so that `validate()` passes even though the columns are gone from the list.
-    
     
     # 1. Identify columns to remove
     for name, col in list(config_builder._column_configs.items()):
@@ -389,7 +356,8 @@ def Run_Generator_Model_PREVIEW():
 
     return preview.dataset
 
-
+# REAL VERSION (full generation)
+# Use Run_Generator_Model_PREVIEW() for testing 
 def Run_Generator_Model_FULL():
     output_file_name = "data/synthetic_data/Raw_Generator_Model_Results_FULL.csv"
     
@@ -481,19 +449,220 @@ def Unpack_Synthetic_Data(results_df):
 
     print(f"Saved unpacked data to {final_path}")
 
-    
 
-Setup_And_Cleaning.Clean_Seed_Data()       # clean the dataset
-seed_dataset = Send_Seed_To_EntityStore()  # send dataset to entity store
-seed_dataset_id = seed_dataset.id          # get dataset id
+''' 
+Use NeMo Evaluator with LLM-as-a-Judge to grade each result from the generator
+This sends the generator output + original reference data to a judge LLM which scores
+each row on realism, consistency, and completeness.
+Uses the "data" task type (no target model inference needed, we already have outputs).
+basic overview: https://docs.nvidia.com/nemo/microservices/latest/evaluate/index.html
+use llm as a judge: https://docs.nvidia.com/nemo/microservices/latest/evaluate/flows/llm-as-a-judge.html
+'''
+def Run_Judge_Model(results_df):
+    print("\n=== Starting Judge Evaluation via NeMo Evaluator...")
 
-Setup_And_Cleaning.Split_Dataset(seed_dataset_path)  # Split the single seed dataset into training/validation/testing folders
-Send_Dataset_Files_HF(HF_REPO_ID)                    # upload to hf
-Connect_Data_To_Nemo(seed_dataset, seed_dataset_id)                       
-#Add_Models_To_Config()                              # add models to config builder TODO: this might get added to to config in its init, so might not need a function
-Map_Columns_To_Models()                              # give the models their prompts
+    evaluator_client = NeMoMicroservices(base_url=os.environ["EVALUATOR_BASE_URL"])
 
-config_builder.validate()  # test columns are config'd right
+    # Build rows from generator output for the evaluator
+    # Each row contains the original seed context + the synthetic trade JSON the generator produced
+    rows = []
+    for _, row in results_df.iterrows():
+        synthetic_json = str(row.get("new_synthetic_trade_json", ""))
+        if not synthetic_json or synthetic_json == "nan":
+            continue
+        rows.append({
+            "ticker": str(row.get("ticker", "")),
+            "original_entry_price": str(row.get("entry_price", "")),
+            "original_volatility": str(row.get("entry_volatility_percent", "")),
+            "target_volatility": str(row.get("target_volatility", "")),
+            "synthetic_trade_json": synthetic_json
+        })
+
+    if not rows:
+        print("No synthetic trades to evaluate. Skipping judge.")
+        return None
+
+    print(f"Evaluating {len(rows)} synthetic trades...")
+
+    # Judge model config - uses an instruct model from build.nvidia.com
+    # (base models can't follow judge formatting instructions, so we use an instruct variant)
+    judge_model = { # TODO: need to use the config builder to get model info
+        "api_endpoint": {
+            "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+            "model_id": "meta/llama-3.1-8b-instruct", 
+            "api_key": os.environ["NIM_API_KEY"]
+        }
+    }
+
+    # Evaluation config: "data" task with LLM-as-a-judge metric.
+    # The judge sees each row's original reference data + the synthetic output,
+    # then scores on 3 criteria using a strict format we parse with regex.
+    config = {
+        "type": "custom",
+        "tasks": {
+            "synthetic-trade-quality": {
+                "type": "data",
+                "metrics": {
+                    "trade-quality-judge": {
+                        "type": "llm-judge",
+                        "params": {
+                            "model": judge_model,
+                            "template": {
+                                "messages": [
+                                    {
+                                        "role": "system",
+                                        "content": (
+                                            "You are a financial data quality auditor specializing in synthetic trading data. "
+                                            "You evaluate whether synthetically generated stock trades are realistic and internally consistent."
+                                        )
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": (
+                                            "Evaluate the quality of this synthetic trade.\n\n"
+                                            "ORIGINAL REFERENCE DATA:\n"
+                                            "- Ticker: {{item.ticker}}\n"
+                                            "- Original Entry Price: ${{item.original_entry_price}}\n"
+                                            "- Original Entry Volatility: {{item.original_volatility}}%\n"
+                                            "- Target Volatility for Synthesis: {{item.target_volatility}}%\n\n"
+                                            "GENERATED SYNTHETIC TRADE:\n"
+                                            "{{item.synthetic_trade_json}}\n\n"
+                                            "Score each criterion from 1 (poor) to 5 (excellent):\n\n"
+                                            "1. REALISM: Are the generated price, volatility, and exit percent values "
+                                            "within a plausible range for the given ticker? Prices should be positive, "
+                                            "volatility should be a small percentage, exit percents should be realistic.\n\n"
+                                            "2. CONSISTENCY: Do the fields form a coherent trade? The entry_volatility_percent "
+                                            "should reflect the target volatility. The worst_exit_percent and "
+                                            "trade_best_exit_percent should scale proportionally with volatility. "
+                                            "Higher target volatility should mean wider exit ranges.\n\n"
+                                            "3. COMPLETENESS: Does the output contain all required keys "
+                                            "(ticker, entry_time, entry_price, entry_volatility_percent, "
+                                            "worst_exit_percent, trade_best_exit_percent) with non-empty, "
+                                            "correctly-typed values?\n\n"
+                                            "You MUST respond exactly in this format:\n"
+                                            "REALISM: <score>\n"
+                                            "CONSISTENCY: <score>\n"
+                                            "COMPLETENESS: <score>"
+                                        )
+                                    }
+                                ],
+                                "max_tokens": 256,  # TODO: figure out how to use the config builder for this
+                                "temperature": 0.1  # TODO: figure out how to use the config builder for this
+                            },
+                            "scores": {
+                                "realism": {
+                                    "type": "int",
+                                    "parser": {
+                                        "type": "regex",
+                                        "pattern": "REALISM:\\s*(\\d)"
+                                    }
+                                },
+                                "consistency": {
+                                    "type": "int",
+                                    "parser": {
+                                        "type": "regex",
+                                        "pattern": "CONSISTENCY:\\s*(\\d)"
+                                    }
+                                },
+                                "completeness": {
+                                    "type": "int",
+                                    "parser": {
+                                        "type": "regex",
+                                        "pattern": "COMPLETENESS:\\s*(\\d)"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # Target: pass generator results directly as rows (no dataset upload needed)
+    target = {
+        "type": "rows",
+        "rows": rows
+    }
+
+    # Submit the evaluation job
+    try:
+        job = evaluator_client.v2.evaluation.jobs.create(
+            spec={
+                "target": target,
+                "config": config
+            }
+        )
+    except Exception as e:
+        print(f"Failed to create evaluation job: {e}")
+        print("Verify the evaluator container is running (docker ps) and EVALUATOR_BASE_URL is correct.")
+        return None
+
+    job_id = job.id
+    print(f"Evaluation Job ID: {job_id}")
+
+    # Poll for completion
+    MAX_EVAL_TIME = 600  # 10 minutes
+    start_time = time.time()
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > MAX_EVAL_TIME:
+            print(f"\nEvaluation job exceeded {MAX_EVAL_TIME}s timeout.")
+            break
+
+        try:
+            job_status = evaluator_client.v2.evaluation.jobs.status.retrieve(job_id)
+            status = job_status.status
+        except Exception as e:
+            print(f"\nError checking job status: {e}")
+            time.sleep(10)
+            continue
+
+        if status == "completed":
+            print(f"\nEvaluation completed! (took {int(elapsed)}s)")
+            break
+        elif status in ("failed", "error", "cancelled"):
+            print(f"\nEvaluation ended with status: {status}")
+            if hasattr(job_status, 'error_details') and job_status.error_details:
+                print(f"Error details: {job_status.error_details}")
+            return None
+
+        print(f"  Evaluation status: {status} (Elapsed: {int(elapsed)}s)", end='\r')
+        time.sleep(10)
+
+    # Retrieve and display results
+    try:
+        results = evaluator_client.v2.evaluation.jobs.results.evaluation_results.retrieve(job_id)
+        results_json = results.model_dump_json(indent=2, exclude_none=True)
+
+        print("\n=== JUDGE EVALUATION RESULTS ===")
+        print(results_json)
+
+        # Save results to file
+        eval_output_path = "data/synthetic_data/judge_evaluation_results.json"
+        os.makedirs(os.path.dirname(eval_output_path), exist_ok=True)
+        with open(eval_output_path, "w") as f:
+            f.write(results_json)
+        print(f"\nSaved judge results to {eval_output_path}")
+
+        return results
+
+    except Exception as e:
+        print(f"Error retrieving evaluation results: {e}")
+        return None
+
+
+Setup_And_Cleaning.Clean_Seed_Data(SEED_DATASET_PATH)  # clean the dataset
+seed_dataset = Send_To_EntityStore()                   # send dataset to entity store
+seed_dataset_id = seed_dataset.id                      # get dataset id
+
+Setup_And_Cleaning.Split_Dataset(SEED_DATASET_PATH)    # Split the single seed dataset into training/validation/testing folders
+Send_To_HF(HF_REPO_ID)                                 # upload to hf
+Connect_To_Entity_Store(seed_dataset_id)                       
+Map_Columns_To_Models()                                # give the models their prompts
+
+config_builder.validate()                              # test columns are config'd right
 
 # RUN BASIC PREVIEW (low cost)
 results_df = Run_Generator_Model_PREVIEW()
@@ -501,4 +670,5 @@ results_df = Run_Generator_Model_PREVIEW()
 # RUN FULL PROCESS (high cost)
 #results_df = Run_Generator_Model_FULL()
 
-Unpack_Synthetic_Data(results_df)                    # process the generator model results
+Run_Judge_Model(results_df)                            # grade each synthetic trade via LLM judge
+Unpack_Synthetic_Data(results_df)                      # process the generator model results

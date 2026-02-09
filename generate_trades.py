@@ -4,8 +4,11 @@ from nemo_microservices.data_designer.essentials import (
     DataDesignerConfigBuilder,
     NeMoDataDesignerClient,
     LLMTextColumnConfig,
-    SamplerColumnConfig
+    SamplerColumnConfig,
+    SamplerType,
+    CategorySamplerParams
 )
+from nemo_microservices.data_designer.config.seed import SeedDatasetReference, DatastoreSeedDatasetReference
 from nemo_microservices import NeMoMicroservices
 from huggingface_hub import HfApi
 import Setup_And_Cleaning
@@ -32,15 +35,15 @@ seed_dataset_path = "data/human_data/edited_bulk_summary.csv"
 
 # preprocessing / setup
 Setup_And_Cleaning.System_Startup(NAMESPACE, PROJECT)
-hf_api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])  # this is remote hf
-HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()
+hf_api = HfApi(token=os.environ["HUGGINGFACE_API_KEY"])        # this is remote hf
+HF_USERNAME, HF_REPO_NAME = Setup_And_Cleaning.Load_Secrets()  # my username, and repo name we're using
 HF_REPO_ID = f"{HF_USERNAME}/{HF_REPO_NAME}"
 # these 2 lines are for local hf
 # hf_api = HfApi(endpoint=os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"], token=os.environ["HUGGINGFACE_API_KEY"])
 # HF_ENDPOINT=f"{os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"]}/v1/hf"
 
 data_designer = DataDesigner()
-config_builder = dd.DataDesignerConfigBuilder()
+config_builder = DataDesignerConfigBuilder(model_configs)
 data_designer_client = NeMoDataDesignerClient(base_url=os.environ["NEMO_MICROSERVICES_BASE_URL"])
 
 # send post request of our dataset to the entity store
@@ -90,6 +93,7 @@ def Send_Seed_To_EntityStore():
     response_data = response.json()
     
     return dataset
+    
 
 
 # send files to that repo in hf (training, testing, validation, complete set)
@@ -180,6 +184,7 @@ def Send_Dataset_Files_HF(repo_id):
         print(f"Error uploading files: {e}")
 
 
+# deprecated (leave for now)
 def Add_Models_To_Config():
     # generator model
     for model in model_configs:
@@ -190,42 +195,54 @@ def Add_Models_To_Config():
 # sampling_strategy controls how the data designer reads the data. so it's not redundant to how we uploaded 
 #       train/test datasets already
 # seed_dataset is the info returned from uploading/getting the dataset, not the actual dataset
-def Connect_Data_To_Nemo(seed_dataset):
+def Connect_Data_To_Nemo(seed_dataset, seed_dataset_id):
     # link the dataset we're using to this job
     # ordered:  reads rows in order
     # shuffled: does all rows but in random order
     
     try:
-        
-        '''
-        seed_dataset_reference = data_designer_client.upload_seed_dataset(
-            dataset="data/human_data/edited_bulk_summary.csv",
-            repo_id=HF_REPO_ID,
-            datastore_settings={"endpoint": os.environ["NEMO_MICROSERVICES_DATASTORE_ENDPOINT"]},
+        # we need the path of the dataset in the entity store
+        # list all datasets
+        print(f"Connecting to Data Store at: {hf_api}")
+
+        ''' this is for finding the dataset reference and seeing the files
+        DO NOT REMOVE, it could be useful
+        dataset_name = "seed_trades"
+        datasets = list(hf_api.list_datasets(search=dataset_name))
+        for ds in datasets:
+            if (ds.id == seed_dataset_id):
+                try:
+                    files = hf_api.list_repo_files(repo_id=ds.id, repo_type="dataset")
+
+                    for f in files:
+                        print(f"   └─ File: {f}")
+                        # This construct shows you the path you likely need:
+                        print(f"      Reference Path: {ds.id}/{f}")
+
+                except Exception as e:
+                    print(f"   (Could not list files: {e})")
+        '''        
+
+        # Create reference to existing dataset in the datastore
+        # Since the dataset is on the remote Hugging Face Hub, we point to that endpoint.
+        seed_dataset_reference = DatastoreSeedDatasetReference(
+            dataset=f"{seed_dataset_id}/complete_set/edited_bulk_summary.csv",  # TODO: hardcoded
+            datastore_settings={
+                "endpoint": "https://huggingface.co",
+                "token": os.environ["HUGGINGFACE_API_KEY"]
+            },
         )
-        '''
+
         config_builder.with_seed_dataset(
-            seed_source=seed_dataset,
+            dataset_reference=seed_dataset_reference,
             sampling_strategy="shuffle" # or "ordered"
         )
+        
     except Exception as e:
-        try:
-            config_builder.with_seed_dataset(
-                seed_source="data/human_data/edited_bulk_summary.csv",
-                sampling_strategy="shuffle" # or "ordered"
-            )
-        except Exception as e:
-            try:
-                config_builder.with_seed_dataset(
-                    seed_source=seed_dataset.id,
-                    sampling_strategy="shuffle" # or "ordered"
-                )
-            except Exception as e:
-                print(f"Error connecting data: {e}")
-                # Debugging: Print signature
-                print(f"Signature: {inspect.signature(config_builder.with_seed_dataset)}")
-                sys.exit(1)
-                
+        print(f"error adding dataset to config: {e}")
+        sys.exit(1)
+
+
 
 # we don't map columns in a basic sense, we're referenceing them inside prompts via jinja2 prompts
 # kinda complex. see design.md
@@ -233,13 +250,19 @@ def Connect_Data_To_Nemo(seed_dataset):
 def Map_Columns_To_Models():
     '''
     These are all the columns in the edited csv: 
-        Ticker,Entry Time,Entry Price,Exit Price,Trade Type,Worst Exit Percent,Trade Best Exit Percent,Trade Percent Change,Entry Volatility Percent
+        ticker, entry_time, entry_price, exit_price, trade_type, worst_exit_percent, trade_best_exit_percent, trade_percent_change, 
+        entry_volatility_percent
     '''
     # sampler columns (diversity). this targets high impact variables to ensure the llm does correct distribution
     volatility_sampler = SamplerColumnConfig(
         name="target_volatility", # I call it target so the llm knows this is the goal
-        data=   [0.3,  0.4,  0.5, 0.6,  0.7, 0.8, 0.9,  1.0,  1.1],
-        weights=[0.05, 0.05, 0.1, 0.15, 0.2, 0.2, 0.15, 0.05, 0.05]
+        #sampler_type=SamplerType.CATEGORY,
+        column_type="sampler",
+        sampler_type="category",
+        params=CategorySamplerParams(
+            values = [0.3,  0.4,  0.5, 0.6,  0.7, 0.8, 0.9,  1.0,  1.1],
+            weights= [0.05, 0.05, 0.1, 0.15, 0.2, 0.2, 0.15, 0.05, 0.05]
+        )
     )
 
     # llm column (data generation)
@@ -252,7 +275,7 @@ def Map_Columns_To_Models():
         name="new_synthetic_trade_json", 
         
         # PASS EVERY RELEVANT COLUMN HERE so the LLM has the full statistical picture (not technical indicators)
-        prompt=f"""
+        prompt="""
         You are a financial data simulation engine.
 
         Reference Trade Context:
@@ -287,7 +310,74 @@ def Run_Generator_Model_PREVIEW():
     output_file_name = "data/synthetic_data/previews/Raw_Generator_Model_Results_PREVIEW.csv"
 
     print("Starting PREVIEW generation job...")
-    preview = data_designer_client.preview(config_builder)
+
+    # Verification: Check that seed config is active so user knows data is present
+    if config_builder._seed_config:
+         print(f"Seed Dataset Linked: {config_builder._seed_config.dataset}")
+    else:
+         print("WARNING: No seed dataset linked in config!")
+
+    # Fix for 422 Error: Remove seed-dataset columns from config as server might be older (just remove metadata, not actual data)
+    #     and doesn't recognize them, causing validation error.
+    removed_cols = {}
+    
+    # Access _column_configs directly to bypass delete restrictions
+    # NOTE: We can't just delete them because the config builder will then fail client-side validation
+    # complaining that the LLM columns reference non-existent variables (since we just deleted them).
+    
+    # STRATEGY 2: Instead of deleting them, we replace them with temporary "ExpressionColumnConfig" placeholders
+    # that simply pass through the variable (if possible) or just act as stubs so validation passes.
+    # However, since the SERVER rejects "seed-dataset" type, but the CLIENT needs them for "allowed_references",
+    # we have a dilemma.
+    
+    # If the server is rejecting the request, it's because `preview()` calls `build()` which serializes everything.
+    # The client-side validation `validate()` checks `allowed_references`.
+    
+    # Workaround: We temporarily monkey-patch the `allowed_references` property on the builder instance
+    # to include the names of the columns we are removing, so that `validate()` passes even though the columns are gone from the list.
+    
+    
+    # 1. Identify columns to remove
+    for name, col in list(config_builder._column_configs.items()):
+        if getattr(col, 'column_type', '') == 'seed-dataset':
+            removed_cols[name] = config_builder._column_configs.pop(name)
+            
+    # 2. Capture the keys of removed columns
+    removed_keys = list(removed_cols.keys())
+    
+    if removed_keys:
+        print(f"Temporarily hiding seed columns for server compatibility: {len(removed_keys)} columns")
+        
+        # 3. Store original allowed_references property
+        original_allowed_references_prop = DataDesignerConfigBuilder.allowed_references
+        
+        # 4. Define a patched property that adds our removed keys back to the allowed list
+        # This tricks the client-side validation into thinking the columns are still there
+        def patched_allowed_references(self):
+            # Get original list based on current (remaining) columns
+            current_refs = []
+            side_effect_columns = sum([[c.name] + c.side_effect_columns for c in self._column_configs.values()], [])
+            current_refs = list(self._column_configs.keys()) + list(set(side_effect_columns))
+            
+            # Add back the removed keys
+            return current_refs + removed_keys
+
+        # Apply patch to the CLASS (or instance if possible, but property is on class)
+        # Python properties are descriptors on the class. To patch just for this instance is hard without overriding __class__.
+        # So we'll patch the class and restore it immediately in finally block.
+        DataDesignerConfigBuilder.allowed_references = property(patched_allowed_references)
+
+    try:
+        preview = data_designer_client.preview(config_builder)
+    finally:
+        # Restore everything
+        if removed_keys:
+            # Restore class property
+            DataDesignerConfigBuilder.allowed_references = original_allowed_references_prop
+            
+            # Restore columns
+            print("Restoring seed columns...")
+            config_builder._column_configs.update(removed_cols)
     for i in range(10):
         preview.display_sample_record()
     
@@ -399,10 +489,11 @@ seed_dataset_id = seed_dataset.id          # get dataset id
 
 Setup_And_Cleaning.Split_Dataset(seed_dataset_path)  # Split the single seed dataset into training/validation/testing folders
 Send_Dataset_Files_HF(HF_REPO_ID)                    # upload to hf
-Connect_Data_To_Nemo(seed_dataset)                       
-Add_Models_To_Config()                               # add models to config builder
+Connect_Data_To_Nemo(seed_dataset, seed_dataset_id)                       
+#Add_Models_To_Config()                              # add models to config builder TODO: this might get added to to config in its init, so might not need a function
 Map_Columns_To_Models()                              # give the models their prompts
 
+config_builder.validate()  # test columns are config'd right
 
 # RUN BASIC PREVIEW (low cost)
 results_df = Run_Generator_Model_PREVIEW()

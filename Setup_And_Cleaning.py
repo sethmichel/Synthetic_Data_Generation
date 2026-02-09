@@ -514,31 +514,37 @@ def Clean_Seed_Data():
     dest_file_name = "edited_bulk_summary.csv"
     dest_path = os.path.join("data/human_data", dest_file_name)
     
-    if not os.path.exists(dest_path):
-        columns_to_remove = ['Date',"Trade Id", "Exit Time", "Dollar Change", "Running Percent By Ticker", "Running Percent All", "Total Investment", 
-                            "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
-                            "Worst Exit Time In Trade", "Trade Holding Reached", 'Time in Trade',
-                            'Entry Atr14','Entry Atr28','Entry Volatility Ratio','Entry Adx28','Entry Adx14',
-                            'Entry Adx7']
+    # remove the check so we always regenerate clean data with correct headers
+    # if not os.path.exists(dest_path):
+    columns_to_remove = ['Date',"Trade Id", "Exit Time", "Dollar Change", "Running Percent By Ticker", "Running Percent All", 
+                         "Total Investment", "Exit Price", "Qty", "Best Exit Price", "Best Exit Time In Trade", "Worst Exit Price", 
+                        "Worst Exit Time In Trade", "Trade Holding Reached", 'Time in Trade','Entry Atr14','Entry Atr28',
+                        'Entry Volatility Ratio','Entry Adx28','Entry Adx14','Entry Adx7']
 
-        with open(seed_dataset_path, 'r', encoding='utf-8') as f_in, open(dest_path, 'w', newline='', encoding='utf-8') as f_out:
-            reader = csv.DictReader(f_in)
+    with open(seed_dataset_path, 'r', encoding='utf-8') as f_in, open(dest_path, 'w', newline='', encoding='utf-8') as f_out:
+        reader = csv.DictReader(f_in)
 
-            # Filter out columns to remove
-            fieldnames = []
-            for field in reader.fieldnames:
-                if field not in columns_to_remove:
-                    fieldnames.append(field)
-            
-            writer = csv.DictWriter(f_out, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            for row in reader:
-                filtered_row = {}
+        # Filter out columns to remove AND normalize names to snake_case
+        fieldnames = []
+        name_mapping = {}  # Map old name -> new name
+        
+        for field in reader.fieldnames:
+            if field not in columns_to_remove:
+                # Convert to snake_case: "Entry Time" -> "entry_time"
+                new_name = field.strip().lower().replace(' ', '_')
+                fieldnames.append(new_name)
+                name_mapping[field] = new_name
+        
+        writer = csv.DictWriter(f_out, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        for row in reader:
+            filtered_row = {}
 
-                for key in fieldnames:
-                    if key in row:
-                        filtered_row[key] = row[key]
+            for key, value in row.items():
+                if key in name_mapping:
+                    filtered_row[name_mapping[key]] = value
 
-                writer.writerow(filtered_row)
+            writer.writerow(filtered_row)
+
 

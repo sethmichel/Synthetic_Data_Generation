@@ -292,3 +292,7 @@ what I need to do is genrate the core data via llm's, then do the technicals mys
 - I'm set up to use nvidia nim (serverless api's via build.nvidia). brev nvidia is renting a linux server with dedicated gpu and pay per hour. I do this if I want to replace the api with my own self-hosted model to save tokens on massive runs. So I think this is if I can't host the system, but both cases use cloud gpu's
 - using the really low power 8b model should just work if I run the code
 - if I ran a 340b model, the same process applies, it'll just work. brev is just the infrastrurure, it's a full computer I rent by the hour. so you use it if you're running a 12 hour job and do'nt want your computer up, or if your computer can't handle the docker containers and stuff. also nim tokens are expensive at scale and thus it's cheaper to use brev
+
+
+
+                                   

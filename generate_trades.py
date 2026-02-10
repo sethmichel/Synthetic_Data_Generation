@@ -9,6 +9,8 @@ from nemo_microservices.data_designer.essentials import (
 )
 from nemo_microservices.data_designer.config.seed import DatastoreSeedDatasetReference
 from huggingface_hub import HfApi
+from typing import TypedDict, List
+from langgraph.graph import StateGraph, START, END
 import os
 import json
 import requests
@@ -506,9 +508,12 @@ def Main():
     # RUN FULL PROCESS (high cost)
     #results_df = Run_Generator_Model_FULL()
 
-    # 7. JUDGE: Grade each synthetic trade via LLM judge.
-    #    This now annotates rows with judge_passed/judge_critique and saves structured JSON.
-    Judge_System.Run_Judge_Model(results_df)
+    # 7. JUDGE + REFINER LOOP:
+    #    - Judge evaluates each generated row
+    #    - Failed rows go through refiner, then are re-judged
+    #    - Max 2 refinement attempts per row to control cost
+    #    This annotates rows with judge/refiner metadata and saves structured JSON
+    Judge_System.Run_Judge_Model(results_df, max_refiner_attempts=2)
 
     # 8. Unpack ONLY passed synthetic trades for downstream usage.
     if "judge_passed" in results_df.columns:

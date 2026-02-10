@@ -3,6 +3,8 @@ import os
 import requests
 import json
 import time
+import re
+import Refiner_System
 
 # Remove markdown fences so we can parse JSON reliably
 def Strip_Markdown_Json_Fences(text):
@@ -80,6 +82,130 @@ def Normalize_Judge_Payload(payload, fallback_critique):
     }
 
 
+def Parse_First_Json_Object(text):
+    clean = Strip_Markdown_Json_Fences(text)
+
+    try:
+        parsed = json.loads(clean)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", clean):
+        start = match.start()
+        try:
+            candidate, _ = decoder.raw_decode(clean[start:])
+            if isinstance(candidate, dict):
+                return candidate
+
+        except Exception:
+            continue
+
+    return None
+
+
+def Judge_One_Row(synthetic_json_raw, few_shot_examples, judge_url, judge_model_id, headers):
+    if Bad_Value_Handler(synthetic_json_raw):
+        critique = "Generator output is empty or missing; cannot judge this row."
+        return {
+            "judge": {
+                "passed": False,
+                "critique": critique,
+                "scores": {
+                    "completeness": 1,
+                    "consistency": 1,
+                    "realism": 1
+                }
+            },
+            "judge_raw_response": "",
+            "clean_trade_json": "",
+            "few_shot_examples": str(few_shot_examples or "")
+        }
+
+    clean_trade_json = Strip_Markdown_Json_Fences(synthetic_json_raw)
+
+    if Bad_Value_Handler(few_shot_examples):
+        few_shot_examples = "No few-shot examples were provided for this row."
+
+    user_prompt = (
+        "You are judging one synthetic stock trade generated from few-shot examples.\n\n"
+        "Compare the generated trade against the provided GOLD FEW-SHOT EXAMPLES.\n\n"
+        f"GOLD FEW-SHOT EXAMPLES:\n{few_shot_examples}\n\n"
+        f"GENERATED SYNTHETIC TRADE JSON:\n{clean_trade_json}\n\n"
+        "Evaluate with these criteria:\n"
+        "1) Completeness: Are all required fields present? Are there null/empty values where there should not be?\n"
+        "2) Consistency: Do values make logical sense together? Use only fields that exist in the JSON.\n"
+        "3) Realism: Does this trade look plausible vs the provided gold examples? Is volatility behavior in expected bounds?\n\n"
+        "Important limits:\n"
+        "- Some checks are impossible without fields that do not exist (ex: buy-vs-short validation). Do not penalize for missing schema fields.\n"
+        "- Required keys are: ticker, entry_time, entry_price, entry_volatility_percent, worst_exit_percent, trade_best_exit_percent.\n\n"
+        "Return ONLY valid JSON (no markdown, no extra text) in exactly this structure:\n"
+        "{\n"
+        '  "passed": true,\n'
+        '  "critique": "short actionable critique",\n'
+        '  "scores": {\n'
+        '    "completeness": 1,\n'
+        '    "consistency": 1,\n'
+        '    "realism": 1\n'
+        "  }\n"
+        "}\n\n"
+        "Set passed=true only if all scores are >= 4 and no required field is missing/empty."
+    )
+
+    payload = {
+        "model": judge_model_id,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a strict financial synthetic-data quality judge. "
+                    "Always output machine-parseable JSON only."
+                )
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 350
+    }
+
+    raw_judge_response = ""
+
+    try:
+        response = requests.post(judge_url, headers=headers, json=payload, timeout=90)
+        response.raise_for_status()
+        response_json = response.json()
+        raw_judge_response = response_json["choices"][0]["message"]["content"]
+
+        parsed_payload = Parse_First_Json_Object(raw_judge_response)
+        normalized = Normalize_Judge_Payload(
+            parsed_payload,
+            "Judge response was missing critique details."
+        )
+        
+    except Exception as e:
+        normalized = {
+            "passed": False,
+            "critique": f"Judge API/parse failure: {e}",
+            "scores": {
+                "completeness": 1,
+                "consistency": 1,
+                "realism": 1
+            }
+        }
+
+    return {
+        "judge": normalized,
+        "judge_raw_response": raw_judge_response,
+        "clean_trade_json": clean_trade_json,
+        "few_shot_examples": str(few_shot_examples)
+    }
+
+
 '''
 Judge each generated trade against:
 1) Completeness
@@ -92,7 +218,7 @@ Returns predictable JSON per row so the future refiner can consume:
   "critique": <string>,
   "scores": {"completeness": 1-5, "consistency": 1-5, "realism": 1-5}
 }'''
-def Run_Judge_Model(results_df):
+def Run_Judge_Model(results_df, max_refiner_attempts=2):
     print("\n=== Starting Judge Evaluation via NIM LLM...")
 
     if results_df is None or results_df.empty:
@@ -112,128 +238,109 @@ def Run_Judge_Model(results_df):
     results_df["judge_completeness"] = 1
     results_df["judge_consistency"] = 1
     results_df["judge_realism"] = 1
+    results_df["refiner_attempts"] = 0
+    results_df["refiner_applied"] = False
+    results_df["refiner_history"] = "[]"
 
     evaluations = []
     total_rows = len(results_df)
 
     for idx, row in results_df.iterrows():
-        synthetic_json_raw = row.get("new_synthetic_trade_json", "")
+        synthetic_json_current = row.get("new_synthetic_trade_json", "")
         few_shot_examples = row.get("few_shot_examples", "")
+        target_ticker = str(row.get("ticker", ""))
+        target_volatility = str(row.get("target_volatility", ""))
 
-        if Bad_Value_Handler(synthetic_json_raw):
-            critique = "Generator output is empty or missing; cannot judge this row."
-            results_df.at[idx, "judge_passed"] = False
-            results_df.at[idx, "judge_critique"] = critique
-            evaluations.append({
-                "row_index": int(idx),
-                "ticker": str(row.get("ticker", "")),
-                "target_volatility": str(row.get("target_volatility", "")),
-                "judge": {
-                    "passed": False,
-                    "critique": critique,
-                    "scores": {
-                        "completeness": 1,
-                        "consistency": 1,
-                        "realism": 1
-                    }
-                },
-                "judge_raw_response": ""
-            })
-            continue
-
-        clean_trade_json = Strip_Markdown_Json_Fences(synthetic_json_raw)
-
-        # Keep the original few-shot text exactly as produced by the sampler.
-        if Bad_Value_Handler(few_shot_examples):
-            few_shot_examples = "No few-shot examples were provided for this row."
-
-        user_prompt = (
-            "You are judging one synthetic stock trade generated from few-shot examples.\n\n"
-            "Compare the generated trade against the provided GOLD FEW-SHOT EXAMPLES.\n\n"
-            f"GOLD FEW-SHOT EXAMPLES:\n{few_shot_examples}\n\n"
-            f"GENERATED SYNTHETIC TRADE JSON:\n{clean_trade_json}\n\n"
-            "Evaluate with these criteria:\n"
-            "1) Completeness: Are all required fields present? Are there null/empty values where there should not be?\n"
-            "2) Consistency: Do values make logical sense together? Use only fields that exist in the JSON.\n"
-            "3) Realism: Does this trade look plausible vs the provided gold examples? Is volatility behavior in expected bounds?\n\n"
-            "Important limits:\n"
-            "- Some checks are impossible without fields that do not exist (ex: buy-vs-short validation). Do not penalize for missing schema fields.\n"
-            "- Required keys are: ticker, entry_time, entry_price, entry_volatility_percent, worst_exit_percent, trade_best_exit_percent.\n\n"
-            "Return ONLY valid JSON (no markdown, no extra text) in exactly this structure:\n"
-            "{\n"
-            '  "passed": true,\n'
-            '  "critique": "short actionable critique",\n'
-            '  "scores": {\n'
-            '    "completeness": 1,\n'
-            '    "consistency": 1,\n'
-            '    "realism": 1\n'
-            "  }\n"
-            "}\n\n"
-            "Set passed=true only if all scores are >= 4 and no required field is missing/empty."
+        judge_result = Judge_One_Row(
+            synthetic_json_current,
+            few_shot_examples,
+            judge_url,
+            judge_model_id,
+            headers
         )
 
-        payload = {
-            "model": judge_model_id,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a strict financial synthetic-data quality judge. "
-                        "Always output machine-parseable JSON only."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ],
-            "temperature": 0.1,
-            "max_tokens": 350
-        }
+        normalized = judge_result["judge"]
+        raw_judge_response = judge_result["judge_raw_response"]
+        clean_trade_json = judge_result["clean_trade_json"]
+        normalized_few_shot = judge_result["few_shot_examples"]
 
-        raw_judge_response = ""
-        normalized = None
+        refiner_attempts = 0
+        refiner_history = []
 
-        try:
-            response = requests.post(judge_url, headers=headers, json=payload, timeout=90)
-            response.raise_for_status()
-            response_json = response.json()
-            raw_judge_response = response_json["choices"][0]["message"]["content"]
-
-            cleaned_judge_response = Strip_Markdown_Json_Fences(raw_judge_response)
-            parsed_payload = json.loads(cleaned_judge_response)
-            normalized = Normalize_Judge_Payload(
-                parsed_payload,
-                "Judge response was missing critique details."
+        while not normalized["passed"] and refiner_attempts < max_refiner_attempts:
+            refiner_attempts += 1
+            refine_result = Refiner_System.Refine_Trade_Row(
+                original_trade_json_raw=synthetic_json_current,
+                few_shot_examples=normalized_few_shot,
+                judge_critique=normalized["critique"],
+                target_ticker=target_ticker,
+                target_volatility=target_volatility
             )
-        except Exception as e:
-            normalized = {
-                "passed": False,
-                "critique": f"Judge API/parse failure: {e}",
-                "scores": {
-                    "completeness": 1,
-                    "consistency": 1,
-                    "realism": 1
-                }
+
+            synthetic_json_current = refine_result["refined_json_text"]
+            attempt_log = {
+                "attempt": refiner_attempts,
+                "judge_critique_in": normalized["critique"],
+                "refiner_success": bool(refine_result["success"]),
+                "refiner_error": refine_result["error"],
+                "refiner_raw_response": refine_result["raw_refiner_response"]
             }
 
+            if not refine_result["success"]:
+                normalized = {
+                    "passed": False,
+                    "critique": (
+                        f"{normalized['critique']} | "
+                        f"{refine_result['error']}"
+                    ),
+                    "scores": normalized["scores"]
+                }
+                refiner_history.append(attempt_log)
+                break
+
+            judge_result = Judge_One_Row(
+                synthetic_json_current,
+                normalized_few_shot,
+                judge_url,
+                judge_model_id,
+                headers
+            )
+            normalized = judge_result["judge"]
+            raw_judge_response = judge_result["judge_raw_response"]
+            clean_trade_json = judge_result["clean_trade_json"]
+
+            attempt_log["judge_after_refine"] = normalized
+            attempt_log["judge_raw_response_after_refine"] = raw_judge_response
+            refiner_history.append(attempt_log)
+
+        # Persist refined JSON back to the dataframe so downstream unpacking uses the final row.
+        results_df.at[idx, "new_synthetic_trade_json"] = synthetic_json_current
         results_df.at[idx, "judge_passed"] = bool(normalized["passed"])
         results_df.at[idx, "judge_critique"] = normalized["critique"]
         results_df.at[idx, "judge_completeness"] = normalized["scores"]["completeness"]
         results_df.at[idx, "judge_consistency"] = normalized["scores"]["consistency"]
         results_df.at[idx, "judge_realism"] = normalized["scores"]["realism"]
+        results_df.at[idx, "refiner_attempts"] = int(refiner_attempts)
+        results_df.at[idx, "refiner_applied"] = bool(refiner_attempts > 0)
+        results_df.at[idx, "refiner_history"] = json.dumps(refiner_history, ensure_ascii=True)
 
         evaluations.append({
             "row_index": int(idx),
-            "ticker": str(row.get("ticker", "")),
-            "target_volatility": str(row.get("target_volatility", "")),
+            "ticker": target_ticker,
+            "target_volatility": target_volatility,
+            "refiner_attempts": int(refiner_attempts),
             "synthetic_trade_json": clean_trade_json,
-            "few_shot_examples": str(few_shot_examples),
+            "few_shot_examples": normalized_few_shot,
             "judge": normalized,
-            "judge_raw_response": raw_judge_response
+            "judge_raw_response": raw_judge_response,
+            "refiner_history": refiner_history
         })
 
-        print(f"Judged row {idx + 1}/{total_rows} - passed={normalized['passed']}", end='\r')
+        print(
+            f"Judged row {idx + 1}/{total_rows} - "
+            f"passed={normalized['passed']} - refiner_attempts={refiner_attempts}",
+            end='\r'
+        )
 
     print("")
 

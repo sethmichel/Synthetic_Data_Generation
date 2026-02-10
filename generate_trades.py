@@ -8,10 +8,7 @@ from nemo_microservices.data_designer.essentials import (
     CategorySamplerParams
 )
 from nemo_microservices.data_designer.config.seed import DatastoreSeedDatasetReference
-from nemo_microservices import NeMoMicroservices
 from huggingface_hub import HfApi
-import Setup_And_Cleaning
-from Models import model_hash_map
 import os
 import json
 import requests
@@ -19,7 +16,10 @@ import sys
 import pandas as pd
 import time
 from datetime import date
+from Models import model_hash_map
+import Setup_And_Cleaning
 import Sampler_System
+import Judge_System
 
 
 # misc configs
@@ -471,207 +471,7 @@ def Unpack_Synthetic_Data(results_df):
     print(f"Saved unpacked data to {final_path}")
 
 
-''' 
-Use NeMo Evaluator with LLM-as-a-Judge to grade each result from the generator
-This sends the generator output + original reference data to a judge LLM which scores
-each row on realism, consistency, and completeness.
-Uses the "data" task type (no target model inference needed, we already have outputs).
-basic overview: https://docs.nvidia.com/nemo/microservices/latest/evaluate/index.html
-use llm as a judge: https://docs.nvidia.com/nemo/microservices/latest/evaluate/flows/llm-as-a-judge.html
-'''
-def Run_Judge_Model(results_df):
-    print("\n=== Starting Judge Evaluation via NeMo Evaluator...")
 
-    evaluator_client = NeMoMicroservices(base_url=os.environ["EVALUATOR_BASE_URL"])
-
-    # Build rows from generator output for the evaluator
-    # Each row contains the original seed context + the synthetic trade JSON the generator produced
-    rows = []
-    for _, row in results_df.iterrows():
-        synthetic_json = str(row.get("new_synthetic_trade_json", ""))
-        if not synthetic_json or synthetic_json == "nan":
-            continue
-        rows.append({
-            "ticker": str(row.get("ticker", "")),
-            "original_entry_price": str(row.get("entry_price", "")),
-            "original_volatility": str(row.get("entry_volatility_percent", "")),
-            "target_volatility": str(row.get("target_volatility", "")),
-            "synthetic_trade_json": synthetic_json
-        })
-
-    if not rows:
-        print("No synthetic trades to evaluate. Skipping judge.")
-        return None
-
-    print(f"Evaluating {len(rows)} synthetic trades...")
-
-    # Judge model config - uses an instruct model from build.nvidia.com
-    # (base models can't follow judge formatting instructions, so we use an instruct variant)
-    judge_model = { # TODO: need to use the config builder to get model info
-        "api_endpoint": {
-            "url": "https://integrate.api.nvidia.com/v1/chat/completions",
-            "model_id": "meta/llama-3.1-8b-instruct", 
-            "api_key": os.environ["NIM_API_KEY"]
-        }
-    }
-
-    # Evaluation config: "data" task with LLM-as-a-judge metric.
-    # The judge sees each row's original reference data + the synthetic output,
-    # then scores on 3 criteria using a strict format we parse with regex.
-    config = {
-        "type": "custom",
-        "tasks": {
-            "synthetic-trade-quality": {
-                "type": "data",
-                "metrics": {
-                    "trade-quality-judge": {
-                        "type": "llm-judge",
-                        "params": {
-                            "model": judge_model,
-                            "template": {
-                                "messages": [
-                                    {
-                                        "role": "system",
-                                        "content": (
-                                            "You are a financial data quality auditor specializing in synthetic trading data. "
-                                            "You evaluate whether synthetically generated stock trades are realistic and internally consistent."
-                                        )
-                                    },
-                                    {
-                                        "role": "user",
-                                        "content": (
-                                            "Evaluate the quality of this synthetic trade.\n\n"
-                                            "ORIGINAL REFERENCE DATA:\n"
-                                            "- Ticker: {{item.ticker}}\n"
-                                            "- Original Entry Price: ${{item.original_entry_price}}\n"
-                                            "- Original Entry Volatility: {{item.original_volatility}}%\n"
-                                            "- Target Volatility for Synthesis: {{item.target_volatility}}%\n\n"
-                                            "GENERATED SYNTHETIC TRADE:\n"
-                                            "{{item.synthetic_trade_json}}\n\n"
-                                            "Score each criterion from 1 (poor) to 5 (excellent):\n\n"
-                                            "1. REALISM: Are the generated price, volatility, and exit percent values "
-                                            "within a plausible range for the given ticker? Prices should be positive, "
-                                            "volatility should be a small percentage, exit percents should be realistic.\n\n"
-                                            "2. CONSISTENCY: Do the fields form a coherent trade? The entry_volatility_percent "
-                                            "should reflect the target volatility. The worst_exit_percent and "
-                                            "trade_best_exit_percent should scale proportionally with volatility. "
-                                            "Higher target volatility should mean wider exit ranges.\n\n"
-                                            "3. COMPLETENESS: Does the output contain all required keys "
-                                            "(ticker, entry_time, entry_price, entry_volatility_percent, "
-                                            "worst_exit_percent, trade_best_exit_percent) with non-empty, "
-                                            "correctly-typed values?\n\n"
-                                            "You MUST respond exactly in this format:\n"
-                                            "REALISM: <score>\n"
-                                            "CONSISTENCY: <score>\n"
-                                            "COMPLETENESS: <score>"
-                                        )
-                                    }
-                                ],
-                                "max_tokens": 256,  # TODO: figure out how to use the config builder for this
-                                "temperature": 0.1  # TODO: figure out how to use the config builder for this
-                            },
-                            "scores": {
-                                "realism": {
-                                    "type": "int",
-                                    "parser": {
-                                        "type": "regex",
-                                        "pattern": "REALISM:\\s*(\\d)"
-                                    }
-                                },
-                                "consistency": {
-                                    "type": "int",
-                                    "parser": {
-                                        "type": "regex",
-                                        "pattern": "CONSISTENCY:\\s*(\\d)"
-                                    }
-                                },
-                                "completeness": {
-                                    "type": "int",
-                                    "parser": {
-                                        "type": "regex",
-                                        "pattern": "COMPLETENESS:\\s*(\\d)"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    # Target: pass generator results directly as rows (no dataset upload needed)
-    target = {
-        "type": "rows",
-        "rows": rows
-    }
-
-    # Submit the evaluation job
-    try:
-        job = evaluator_client.v2.evaluation.jobs.create(
-            spec={
-                "target": target,
-                "config": config
-            }
-        )
-    except Exception as e:
-        print(f"Failed to create evaluation job: {e}")
-        print("Verify the evaluator container is running (docker ps) and EVALUATOR_BASE_URL is correct.")
-        return None
-
-    job_id = job.id
-    print(f"Evaluation Job ID: {job_id}")
-
-    # Poll for completion
-    MAX_EVAL_TIME = 600  # 10 minutes
-    start_time = time.time()
-
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed > MAX_EVAL_TIME:
-            print(f"\nEvaluation job exceeded {MAX_EVAL_TIME}s timeout.")
-            break
-
-        try:
-            job_status = evaluator_client.v2.evaluation.jobs.status.retrieve(job_id)
-            status = job_status.status
-        except Exception as e:
-            print(f"\nError checking job status: {e}")
-            time.sleep(10)
-            continue
-
-        if status == "completed":
-            print(f"\nEvaluation completed! (took {int(elapsed)}s)")
-            break
-        elif status in ("failed", "error", "cancelled"):
-            print(f"\nEvaluation ended with status: {status}")
-            if hasattr(job_status, 'error_details') and job_status.error_details:
-                print(f"Error details: {job_status.error_details}")
-            return None
-
-        print(f"  Evaluation status: {status} (Elapsed: {int(elapsed)}s)", end='\r')
-        time.sleep(10)
-
-    # Retrieve and display results
-    try:
-        results = evaluator_client.v2.evaluation.jobs.results.evaluation_results.retrieve(job_id)
-        results_json = results.model_dump_json(indent=2, exclude_none=True)
-
-        print("\n=== JUDGE EVALUATION RESULTS ===")
-        print(results_json)
-
-        # Save results to file
-        eval_output_path = "data/synthetic_data/judge_evaluation_results.json"
-        os.makedirs(os.path.dirname(eval_output_path), exist_ok=True)
-        with open(eval_output_path, "w") as f:
-            f.write(results_json)
-        print(f"\nSaved judge results to {eval_output_path}")
-
-        return results
-
-    except Exception as e:
-        print(f"Error retrieving evaluation results: {e}")
-        return None
 
 
 def Main():
@@ -706,10 +506,16 @@ def Main():
     # RUN FULL PROCESS (high cost)
     #results_df = Run_Generator_Model_FULL()
 
-    # 7. JUDGE: Grade each synthetic trade via LLM judge
-    #    Note: Without the refiner model, the judge scores but can't send failures back for rework.
-    #    Once the refiner is built, failed rows will loop: judge -> refiner -> judge (max 2 retries).
-    Run_Judge_Model(results_df)
+    # 7. JUDGE: Grade each synthetic trade via LLM judge.
+    #    This now annotates rows with judge_passed/judge_critique and saves structured JSON.
+    Judge_System.Run_Judge_Model(results_df)
 
-    # 8. Unpack the generator's JSON column into individual rows
-    Unpack_Synthetic_Data(results_df)
+    # 8. Unpack ONLY passed synthetic trades for downstream usage.
+    if "judge_passed" in results_df.columns:
+        approved_df = results_df[results_df["judge_passed"] == True].copy()  # noqa: E712
+        print(f"Unpacking only judge-approved rows: {len(approved_df)} / {len(results_df)}")
+        Unpack_Synthetic_Data(approved_df)
+
+    else:
+        print("Judge columns missing; falling back to unpacking all generator rows.")
+        Unpack_Synthetic_Data(results_df)

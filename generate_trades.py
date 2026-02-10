@@ -19,6 +19,7 @@ import sys
 import pandas as pd
 import time
 from datetime import date
+import Sampler_System
 
 
 # misc configs
@@ -43,6 +44,10 @@ hf_hub_endpoint = "https://huggingface.co"
 data_designer = DataDesigner()
 config_builder = DataDesignerConfigBuilder(models)
 data_designer_client = NeMoDataDesignerClient(base_url=os.environ["NEMO_MICROSERVICES_BASE_URL"])
+
+# set globals in other files
+Sampler_System.Set_Globals(SEED_DATASET_PATH)
+
 
 # send post request of our dataset to the entity store
 # this does the same thing as NeMoDataDesignerClient.upload_seed_dataset
@@ -230,6 +235,9 @@ def Connect_To_Entity_Store(seed_dataset_id):
         sys.exit(1)
 
 
+
+
+
 # we don't map columns in a basic sense, we're referenceing them inside prompts via jinja2 prompts
 # control diversity (distribution of data) and make the llm prompt which applies to each dataset row
 def Map_Columns_To_Models():
@@ -240,8 +248,7 @@ def Map_Columns_To_Models():
     '''
     # sampler columns (diversity). this targets high impact variables to ensure the llm does correct distribution
     volatility_sampler = SamplerColumnConfig(
-        name="target_volatility", # I call it target so the llm knows this is the goal
-        #sampler_type=SamplerType.CATEGORY,
+        name="target_volatility", 
         column_type="sampler",
         sampler_type="category",
         params=CategorySamplerParams(
@@ -250,37 +257,51 @@ def Map_Columns_To_Models():
         )
     )
 
-    # llm column (data generation)
+    # llm column (data generation) - FEW-SHOT approach
     '''
     iterations of this
+    - old: one-shot approach where each row's own columns were the only context. caused mode collapse.
     - old: I added noise of +/- 10% to the volatility. this is replaced by the sampler column
-    - old: I don't think I need best/worst price as a core metric
+    - current: few-shot. The sampler pre-selects 3 gold data points with similar volatility and 
+      stores them in the 'few_shot_examples' column. The generator sees these as grounding examples
+      so it learns the realistic distribution without averaging everything out.
     '''
     synthetic_trade_generator = LLMTextColumnConfig(
         name="new_synthetic_trade_json", 
         
-        # PASS EVERY RELEVANT COLUMN HERE so the LLM has the full statistical picture (not technical indicators)
         prompt="""
-        You are a financial data simulation engine.
+        You are a financial data simulation engine. You generate realistic synthetic stock trades.
 
-        Reference Trade Context:
-        - Ticker: {{ ticker }}
-        - Original Entry Time: {{ entry_time }}
-        - Original Entry Price: {{ entry_price }}
-        - Original Entry Volatility Percent: {{ entry_volatility_percent }}
-        
-        SIMULATION PARAMETERS (You MUST follow these):
-        - Target Volatility to Simulate: {{ target_volatility }}
-        
+        Below are 3 REAL trades from a human trader that occurred at similar volatility levels. 
+        Study their patterns - price ranges, exit percentages, and how they relate to volatility.
+
+        === REFERENCE TRADES (real human data) ===
+        {{ few_shot_examples }}
+        ============================================
+
+        SIMULATION PARAMETERS:
+        - Target Volatility: {{ target_volatility }}
+        - Ticker (from seed row): {{ ticker }}
+
         Task:
-        Generate a SYNTHETIC trade for '{{ ticker }}' that behaves as if the market volatility was exactly '{{ target_volatility }}'.        
+        Generate ONE new synthetic trade that is realistic for the ticker '{{ ticker }}' at a 
+        volatility of {{ target_volatility }}. The trade should look like it belongs alongside 
+        the reference trades above, but must be DISTINCT (not a copy).
 
         Rules:
-        1. **Price Adjustment:** If 'Target Volatility' ({{ target_volatility }}) is higher than 'Original Volatility' ({{ entry_volatility_percent }}), widen the difference between Entry Price and Exit Price (implying bigger swings).
-        2. **Exit Percent:** Adjust 'Worst Exit Percent' and 'Best Exit Percent' to be proportional to the new 'Target Volatility'. (Higher volatility = wider stops and targets).
-        3. **Time:** Keep the Entry Time close to original, but add small jitter.
-        4. **Consistency:** Ensure the new metrics are mathematically consistent with the new volatility.
-        
+        1. **Learn from the examples:** The entry prices, exit percents, and volatility values 
+           in the reference trades show you what realistic ranges look like. Stay within those 
+           patterns but do not duplicate any example exactly.
+        2. **Volatility drives exits:** Higher target volatility means wider worst_exit_percent 
+           and trade_best_exit_percent. The exit percentages should scale proportionally with 
+           the target volatility.
+        3. **Price realism:** The entry_price should be realistic for the ticker. Look at the 
+           reference trade prices for guidance.
+        4. **Time jitter:** Pick an entry_time that is plausible (market hours) and close to 
+           but not identical to the reference times.
+        5. **Internal consistency:** All fields must be mathematically consistent with each other 
+           and with the target volatility.
+
         Output strictly valid JSON with keys: "ticker", "entry_time", "entry_price", "entry_volatility_percent", "worst_exit_percent", "trade_best_exit_percent".
         """,
         model_alias="generator-model"
@@ -653,22 +674,42 @@ def Run_Judge_Model(results_df):
         return None
 
 
-Setup_And_Cleaning.Clean_Seed_Data(SEED_DATASET_PATH)  # clean the dataset
-seed_dataset = Send_To_EntityStore()                   # send dataset to entity store
-seed_dataset_id = seed_dataset.id                      # get dataset id
+def Main():
+    # 1. Clean the raw human data into the seed CSV
+    Setup_And_Cleaning.Clean_Seed_Data(SEED_DATASET_PATH)
 
-Setup_And_Cleaning.Split_Dataset(SEED_DATASET_PATH)    # Split the single seed dataset into training/validation/testing folders
-Send_To_HF(HF_REPO_ID)                                 # upload to hf
-Connect_To_Entity_Store(seed_dataset_id)                       
-Map_Columns_To_Models()                                # give the models their prompts
+    # 2. SAMPLER: Enrich each row with 3 few-shot examples from similar volatility rows.
+    #    This writes a 'few_shot_examples' column into the seed CSV so the generator
+    #    prompt can reference {{ few_shot_examples }} via Jinja2.
+    #    Must happen BEFORE uploading to entity store / HF since they need the enriched CSV.
+    Sampler_System.Enrich_Seed_With_Few_Shot()
 
-config_builder.validate()                              # test columns are config'd right
+    # 3. Upload enriched seed data to entity store and HF
+    seed_dataset = Send_To_EntityStore()                    # send dataset to entity store
+    seed_dataset_id = seed_dataset.id                       # get dataset id
 
-# RUN BASIC PREVIEW (low cost)
-results_df = Run_Generator_Model_PREVIEW()
+    Setup_And_Cleaning.Split_Dataset(SEED_DATASET_PATH)     # split into training/validation/testing
+    Send_To_HF(HF_REPO_ID)                                  # upload to hf
 
-# RUN FULL PROCESS (high cost)
-#results_df = Run_Generator_Model_FULL()
+    # 4. Connect config builder to the entity store seed data
+    Connect_To_Entity_Store(seed_dataset_id)
 
-Run_Judge_Model(results_df)                            # grade each synthetic trade via LLM judge
-Unpack_Synthetic_Data(results_df)                      # process the generator model results
+    # 5. GENERATOR: Map columns (volatility sampler + LLM generator prompt using few-shot examples)
+    Map_Columns_To_Models()
+
+    config_builder.validate()                               # test columns are config'd right
+
+    # 6. Run generator (choose preview or full)
+    # RUN BASIC PREVIEW (low cost)
+    results_df = Run_Generator_Model_PREVIEW()
+
+    # RUN FULL PROCESS (high cost)
+    #results_df = Run_Generator_Model_FULL()
+
+    # 7. JUDGE: Grade each synthetic trade via LLM judge
+    #    Note: Without the refiner model, the judge scores but can't send failures back for rework.
+    #    Once the refiner is built, failed rows will loop: judge -> refiner -> judge (max 2 retries).
+    Run_Judge_Model(results_df)
+
+    # 8. Unpack the generator's JSON column into individual rows
+    Unpack_Synthetic_Data(results_df)

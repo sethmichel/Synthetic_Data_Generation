@@ -23,7 +23,8 @@ SYSTEM_PROMPT = "/no_think"
 #             judge: 
 
 model_hash_map = {"development": 
-    [ModelConfig(
+    [
+        ModelConfig(
             alias="generator-model-development",
             model="nvidia/mistral-nemo-minitron-8b-base",  # https://build.nvidia.com/nvidia/mistral-nemo-minitron-8b-base
             provider=MODEL_PROVIDER,   
@@ -43,11 +44,22 @@ model_hash_map = {"development":
                 top_p=0.9,
                 max_tokens=512,
             ),
-        )
+        ),
+        ModelConfig(
+            alias="refiner-model-development",
+            model="nvidia/mistral-nemo-minitron-8b-base",  # https://build.nvidia.com/nvidia/mistral-nemo-minitron-8b-base
+            provider=MODEL_PROVIDER,   
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
+        ),
     ],
     "mini_prod": [],
     "full_prod": 
-    [ModelConfig(
+    [
+        ModelConfig(
             alias="generator-model-full-prod",
             model="nvidia/mistral-nemotron",  # https://build.nvidia.com/mistralai/mistral-nemotron/modelcard
             provider=MODEL_PROVIDER,   
@@ -66,6 +78,16 @@ model_hash_map = {"development":
                 top_p=0.9,
                 max_tokens=512,
             ),
-        )
+        ),
+        ModelConfig(
+            alias="refiner-model-development",
+            model="nvidia/mistral-nemo-minitron-8b-base",  # https://build.nvidia.com/nvidia/mistral-nemo-minitron-8b-base
+            provider=MODEL_PROVIDER,   
+            inference_parameters=InferenceParameters(
+                temperature=0.5,
+                top_p=0.9,
+                max_tokens=512,
+            ),
+        ),
     ] 
 }

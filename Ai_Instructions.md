@@ -11,3 +11,4 @@ for readability
 - functions should have 2 line breaks between them for readability
 - for loops are not allowed to be 1 line, they should be written out in full 
 - if / else statements are not allowed to be 1 line, they should written out in full
+- any mutli-line comments should use ''' instead of """ quotes

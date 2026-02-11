@@ -148,7 +148,7 @@ combining them
 - if I were to take next steps and really maximize this as far as possible
 	- workflow should adhear to a "data flywheel" concept which is cyclic loops, external knownledge injection, increasing complexity layers.
 	- replace the generator judge setup with: generator, judge, refiner (fix the code in column 1 based on the crituqe in column 2), this fixes bad data instead of throwing it away
-	- inject grounding seeds. synthetic data suffers from mode collapse. we load a small csv of gold examples, use few shot prompting to pull 2-3 random examples into 1 prompt context
+	- inject few shot examples. synthetic data suffers from mode collapse. we load a small csv of gold examples, use few shot prompting to pull 2-3 random examples into 1 prompt context
 	- basically now I ask an llm to the task harder. "write a bubble sort" llm1: "rewrite it to be more complex, add contraints" llm2: "solve the new problem"
 	- if I'm working with data requiring facts then the llm will hallucinate. use nemo retriever. it generates a topic (gpu optimization), queries my vector db for actual documentation on the topic, uses that context to write a tutorial
 	graph TD

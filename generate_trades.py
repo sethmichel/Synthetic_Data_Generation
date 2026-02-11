@@ -9,7 +9,7 @@ from nemo_microservices.data_designer.essentials import (
 )
 from nemo_microservices.data_designer.config.seed import DatastoreSeedDatasetReference
 from huggingface_hub import HfApi
-from typing import TypedDict, List
+from typing import Any, Dict, TypedDict
 from langgraph.graph import StateGraph, START, END
 import os
 import json
@@ -89,16 +89,31 @@ def Send_To_EntityStore():
     }
 
     response = requests.post(
-        f"{os.environ["ENTITY_STORE_BASE_URL"]}/v1/datasets",
+        f"{os.environ['ENTITY_STORE_BASE_URL']}/v1/datasets",
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json"
         },
         json = dataset_info
     )
+    response.raise_for_status()
     response_data = response.json()
     
-    return dataset
+    return response_data
+
+
+def Extract_Dataset_Id(seed_dataset_obj):
+    if seed_dataset_obj is None:
+        return ""
+
+    if isinstance(seed_dataset_obj, str):
+        return seed_dataset_obj.strip()
+
+    if isinstance(seed_dataset_obj, dict):
+        return str(seed_dataset_obj.get("id", "")).strip()
+
+    dataset_id = getattr(seed_dataset_obj, "id", "")
+    return str(dataset_id).strip()
     
 
 # send files to that repo in hf (training, testing, validation, complete set)
@@ -265,7 +280,7 @@ def Map_Columns_To_Models():
     - old: one-shot approach where each row's own columns were the only context. caused mode collapse.
     - old: I added noise of +/- 10% to the volatility. this is replaced by the sampler column
     - current: few-shot. The sampler pre-selects 3 gold data points with similar volatility and 
-      stores them in the 'few_shot_examples' column. The generator sees these as grounding examples
+      stores them in the 'few_shot_examples' column. The generator sees these as few shot examples
       so it learns the realistic distribution without averaging everything out.
     '''
     synthetic_trade_generator = LLMTextColumnConfig(
@@ -446,6 +461,20 @@ def Unpack_Synthetic_Data(results_df):
                 trade_data = json.loads(clean_json.strip())
                 # Add the Real Data tag to the new row
                 trade_data["Real Data"] = f"synthetic {today_str}"
+
+                # Carry judge/refiner metadata forward for full auditability.
+                trade_data["judge_passed"] = row.get("judge_passed", "")
+                trade_data["judge_critique"] = row.get("judge_critique", "")
+                trade_data["judge_completeness"] = row.get("judge_completeness", "")
+                trade_data["judge_consistency"] = row.get("judge_consistency", "")
+                trade_data["judge_realism"] = row.get("judge_realism", "")
+                trade_data["refiner_attempts"] = row.get("refiner_attempts", 0)
+                trade_data["refiner_applied"] = row.get("refiner_applied", False)
+                trade_data["refiner_history"] = row.get("refiner_history", "[]")
+                trade_data["api_error"] = row.get("api_error", False)
+                trade_data["api_error_stage"] = row.get("api_error_stage", "")
+                trade_data["api_error_message"] = row.get("api_error_message", "")
+
                 new_rows.append(trade_data)
                 
         except Exception as e:
@@ -473,54 +502,122 @@ def Unpack_Synthetic_Data(results_df):
     print(f"Saved unpacked data to {final_path}")
 
 
+class PipelineState(TypedDict, total=False):
+    mode: str
+    max_refiner_attempts: int
+    seed_dataset_id: str
+    results_df: pd.DataFrame
+    judge_output: Dict[str, Any]
 
 
-
-def Main():
-    # 1. Clean the raw human data into the seed CSV
+def Clean_Seed_Node(state: PipelineState):
     Setup_And_Cleaning.Clean_Seed_Data(SEED_DATASET_PATH)
+    return {}
 
-    # 2. SAMPLER: Enrich each row with 3 few-shot examples from similar volatility rows.
-    #    This writes a 'few_shot_examples' column into the seed CSV so the generator
-    #    prompt can reference {{ few_shot_examples }} via Jinja2.
-    #    Must happen BEFORE uploading to entity store / HF since they need the enriched CSV.
+
+def Sampler_Node(state: PipelineState):
     Sampler_System.Enrich_Seed_With_Few_Shot()
+    return {}
 
-    # 3. Upload enriched seed data to entity store and HF
-    seed_dataset = Send_To_EntityStore()                    # send dataset to entity store
-    seed_dataset_id = seed_dataset.id                       # get dataset id
 
-    Setup_And_Cleaning.Split_Dataset(SEED_DATASET_PATH)     # split into training/validation/testing
-    Send_To_HF(HF_REPO_ID)                                  # upload to hf
+def Setup_And_Generator_Config_Node(state: PipelineState):
+    seed_dataset = Send_To_EntityStore()
+    seed_dataset_id = Extract_Dataset_Id(seed_dataset)
 
-    # 4. Connect config builder to the entity store seed data
+    if not seed_dataset_id:
+        raise RuntimeError("Could not determine dataset id after entity store upload/check.")
+
+    Setup_And_Cleaning.Split_Dataset(SEED_DATASET_PATH)
+    Send_To_HF(HF_REPO_ID)
     Connect_To_Entity_Store(seed_dataset_id)
-
-    # 5. GENERATOR: Map columns (volatility sampler + LLM generator prompt using few-shot examples)
     Map_Columns_To_Models()
+    config_builder.validate()
 
-    config_builder.validate()                               # test columns are config'd right
+    return {"seed_dataset_id": seed_dataset_id}
 
-    # 6. Run generator (choose preview or full)
-    # RUN BASIC PREVIEW (low cost)
-    results_df = Run_Generator_Model_PREVIEW()
 
-    # RUN FULL PROCESS (high cost)
-    #results_df = Run_Generator_Model_FULL()
-
-    # 7. JUDGE + REFINER LOOP:
-    #    - Judge evaluates each generated row
-    #    - Failed rows go through refiner, then are re-judged
-    #    - Max 2 refinement attempts per row to control cost
-    #    This annotates rows with judge/refiner metadata and saves structured JSON
-    Judge_System.Run_Judge_Model(results_df, max_refiner_attempts=2)
-
-    # 8. Unpack ONLY passed synthetic trades for downstream usage.
-    if "judge_passed" in results_df.columns:
-        approved_df = results_df[results_df["judge_passed"] == True].copy()  # noqa: E712
-        print(f"Unpacking only judge-approved rows: {len(approved_df)} / {len(results_df)}")
-        Unpack_Synthetic_Data(approved_df)
+def Generator_Node(state: PipelineState):
+    requested_mode = str(state.get("mode", "preview")).strip().lower()
+    if requested_mode == "full":
+        results_df = Run_Generator_Model_FULL()
 
     else:
-        print("Judge columns missing; falling back to unpacking all generator rows.")
-        Unpack_Synthetic_Data(results_df)
+        if requested_mode not in ("preview", "full"):
+            print(f"Unknown generator mode '{requested_mode}', defaulting to preview.")
+
+        requested_mode = "preview"
+        results_df = Run_Generator_Model_PREVIEW()
+
+    return {
+        "mode": requested_mode,
+        "results_df": results_df
+    }
+
+
+def Judge_Node(state: PipelineState):
+    results_df = state.get("results_df")
+    max_refiner_attempts = int(state.get("max_refiner_attempts", 2))
+    judge_output = Judge_System.Run_Judge_Model(
+        results_df,
+        max_refiner_attempts=max_refiner_attempts
+    )
+
+    return {
+        "results_df": results_df,
+        "judge_output": judge_output
+    }
+
+
+def Unpack_Node(state: PipelineState):
+    results_df = state.get("results_df")
+
+    if results_df is None or results_df.empty:
+        print("No results dataframe available for unpacking.")
+        return {}
+
+    # Keep all rows (passed/failed/refined) and preserve judge/refiner columns.
+    if "judge_passed" in results_df.columns:
+        passed_count = int(results_df["judge_passed"].sum())
+        total_count = int(len(results_df))
+        print(f"Unpacking all rows with judge metadata: {passed_count} passed / {total_count - passed_count} failed")
+    else:
+        print("Judge columns missing; unpacking all generator rows.")
+
+    Unpack_Synthetic_Data(results_df)
+
+    return {}
+
+
+def Build_Pipeline_Graph():
+    workflow = StateGraph(PipelineState)
+
+    workflow.add_node("clean_seed", Clean_Seed_Node)
+    workflow.add_node("sampler", Sampler_Node)
+    workflow.add_node("setup", Setup_And_Generator_Config_Node)
+    workflow.add_node("generator", Generator_Node)
+    workflow.add_node("judge", Judge_Node)
+    workflow.add_node("unpack", Unpack_Node)
+
+    workflow.add_edge(START, "clean_seed")
+    workflow.add_edge("clean_seed", "sampler")
+    workflow.add_edge("sampler", "setup")
+    workflow.add_edge("setup", "generator")
+    workflow.add_edge("generator", "judge")
+    workflow.add_edge("judge", "unpack")
+    workflow.add_edge("unpack", END)
+
+    return workflow.compile()
+
+
+def Run_LangGraph_Pipeline(mode="preview", max_refiner_attempts=2):
+    app = Build_Pipeline_Graph()
+    initial_state = {
+        "mode": mode,
+        "max_refiner_attempts": int(max_refiner_attempts)
+    }
+    
+    return app.invoke(initial_state)
+
+
+def Main(mode="preview", max_refiner_attempts=2):
+    Run_LangGraph_Pipeline(mode=mode, max_refiner_attempts=max_refiner_attempts)

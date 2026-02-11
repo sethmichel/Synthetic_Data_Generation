@@ -22,8 +22,10 @@ Data is processed by 3 LLMs + a sampler.
 
     - Refiner: In a loop with the judge LLM. Results that the judge fails go here. It receives the judge critique + original few-shot gold examples + failed generated JSON row, and makes minimal edits to fix only the criticized issue while preserving valid fields. Output is forced back into strict JSON form. This is capped at 2 retries and then thrown away.
 
+    - API fault handling: If judge or refiner API calls time out/drop/error or return bad payloads, the system retries once. If the second attempt also fails, that row is marked "api error" and skipped so the run can continue.
+
 **LangGraph**
-- state: contains volatility_constraint, grounding_seeds (the few-shot data), generated_row (the JSON result), judge_critique (Judge LLM feedback), retry_count
+- state: contains volatility_constraint, few shot examples, generated_row (the JSON result), judge_critique (Judge LLM feedback), retry_count
 - nodes: Each LLM gets a function which is a node.
     - sampler_node: Updates few shot examples
     - generator_node: Uses few shot examples to call generator, updates generated_row

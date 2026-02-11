@@ -4,6 +4,8 @@ import requests
 import json
 import time
 import re
+from typing import Any, Dict, List, TypedDict
+from langgraph.graph import StateGraph, START, END
 import Refiner_System
 
 # Remove markdown fences so we can parse JSON reliably
@@ -121,7 +123,11 @@ def Judge_One_Row(synthetic_json_raw, few_shot_examples, judge_url, judge_model_
             },
             "judge_raw_response": "",
             "clean_trade_json": "",
-            "few_shot_examples": str(few_shot_examples or "")
+            "few_shot_examples": str(few_shot_examples or ""),
+            "api_error": False,
+            "api_error_stage": "",
+            "api_error_message": "",
+            "api_attempts": 0
         }
 
     clean_trade_json = Strip_Markdown_Json_Fences(synthetic_json_raw)
@@ -174,36 +180,228 @@ def Judge_One_Row(synthetic_json_raw, few_shot_examples, judge_url, judge_model_
     }
 
     raw_judge_response = ""
+    max_api_attempts = 2
+    last_error = ""
+    attempts_used = 0
 
-    try:
-        response = requests.post(judge_url, headers=headers, json=payload, timeout=90)
-        response.raise_for_status()
-        response_json = response.json()
-        raw_judge_response = response_json["choices"][0]["message"]["content"]
+    for attempt in range(1, max_api_attempts + 1):
+        attempts_used = attempt
+        try:
+            response = requests.post(judge_url, headers=headers, json=payload, timeout=90)
+            response.raise_for_status()
+            response_json = response.json()
+            raw_judge_response = response_json["choices"][0]["message"]["content"]
 
-        parsed_payload = Parse_First_Json_Object(raw_judge_response)
-        normalized = Normalize_Judge_Payload(
-            parsed_payload,
-            "Judge response was missing critique details."
-        )
-        
-    except Exception as e:
-        normalized = {
-            "passed": False,
-            "critique": f"Judge API/parse failure: {e}",
-            "scores": {
-                "completeness": 1,
-                "consistency": 1,
-                "realism": 1
+            parsed_payload = Parse_First_Json_Object(raw_judge_response)
+            if not isinstance(parsed_payload, dict):
+                raise ValueError("Judge response did not contain a parseable JSON object.")
+
+            normalized = Normalize_Judge_Payload(
+                parsed_payload,
+                "Judge response was missing critique details."
+            )
+            return {
+                "judge": normalized,
+                "judge_raw_response": raw_judge_response,
+                "clean_trade_json": clean_trade_json,
+                "few_shot_examples": str(few_shot_examples),
+                "api_error": False,
+                "api_error_stage": "",
+                "api_error_message": "",
+                "api_attempts": attempts_used
             }
-        }
 
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_api_attempts:
+                time.sleep(1)
+                continue
+
+    normalized = {
+        "passed": False,
+        "critique": "api error",
+        "scores": {
+            "completeness": 1,
+            "consistency": 1,
+            "realism": 1
+        }
+    }
     return {
         "judge": normalized,
         "judge_raw_response": raw_judge_response,
         "clean_trade_json": clean_trade_json,
-        "few_shot_examples": str(few_shot_examples)
+        "few_shot_examples": str(few_shot_examples),
+        "api_error": True,
+        "api_error_stage": "judge",
+        "api_error_message": (
+            f"Judge API/parse failure after {max_api_attempts} attempts: {last_error}"
+        ),
+        "api_attempts": attempts_used
     }
+
+
+class RowJudgeRefinerState(TypedDict, total=False):
+    synthetic_json_current: str
+    few_shot_examples: str
+    target_ticker: str
+    target_volatility: str
+    judge_url: str
+    judge_model_id: str
+    headers: Dict[str, str]
+    max_refiner_attempts: int
+    refiner_attempts: int
+    normalized: Dict[str, Any]
+    raw_judge_response: str
+    clean_trade_json: str
+    refiner_history: List[Dict[str, Any]]
+    stop_after_refiner_error: bool
+    last_step_was_refiner: bool
+    api_error: bool
+    api_error_stage: str
+    api_error_message: str
+    api_attempts: int
+
+
+def Judge_Row_Node(state: RowJudgeRefinerState):
+    judge_result = Judge_One_Row(
+        state.get("synthetic_json_current", ""),
+        state.get("few_shot_examples", ""),
+        state["judge_url"],
+        state["judge_model_id"],
+        state["headers"]
+    )
+
+    normalized = judge_result["judge"]
+    raw_judge_response = judge_result["judge_raw_response"]
+    clean_trade_json = judge_result["clean_trade_json"]
+    normalized_few_shot = judge_result["few_shot_examples"]
+
+    # Attach post-refine judge results to the last refiner attempt log.
+    refiner_history = list(state.get("refiner_history", []))
+    if state.get("last_step_was_refiner", False) and refiner_history:
+        refiner_history[-1]["judge_after_refine"] = normalized
+        refiner_history[-1]["judge_raw_response_after_refine"] = raw_judge_response
+
+    return {
+        "normalized": normalized,
+        "raw_judge_response": raw_judge_response,
+        "clean_trade_json": clean_trade_json,
+        "few_shot_examples": normalized_few_shot,
+        "refiner_history": refiner_history,
+        "last_step_was_refiner": False,
+        "api_error": bool(judge_result.get("api_error", False)),
+        "api_error_stage": str(judge_result.get("api_error_stage", "")),
+        "api_error_message": str(judge_result.get("api_error_message", "")),
+        "api_attempts": int(judge_result.get("api_attempts", 0))
+    }
+
+
+def Route_After_Judge(state: RowJudgeRefinerState):
+    if bool(state.get("api_error", False)):
+        return END
+
+    normalized = state.get("normalized", {})
+    passed = bool(normalized.get("passed", False))
+    refiner_attempts = int(state.get("refiner_attempts", 0))
+    max_refiner_attempts = int(state.get("max_refiner_attempts", 2))
+
+    if passed:
+        return END
+
+    if refiner_attempts >= max_refiner_attempts:
+        return END
+
+    return "refiner"
+
+
+def Refiner_Row_Node(state: RowJudgeRefinerState):
+    refiner_attempts = int(state.get("refiner_attempts", 0)) + 1
+    normalized = state.get("normalized", {})
+    synthetic_json_current = state.get("synthetic_json_current", "")
+    normalized_few_shot = state.get("few_shot_examples", "")
+    refiner_history = list(state.get("refiner_history", []))
+
+    refine_result = Refiner_System.Refine_Trade_Row(
+        original_trade_json_raw=synthetic_json_current,
+        few_shot_examples=normalized_few_shot,
+        judge_critique=normalized.get("critique", ""),
+        target_ticker=state.get("target_ticker", ""),
+        target_volatility=state.get("target_volatility", "")
+    )
+
+    synthetic_json_current = refine_result["refined_json_text"]
+    attempt_log = {
+        "attempt": refiner_attempts,
+        "judge_critique_in": normalized.get("critique", ""),
+        "refiner_success": bool(refine_result["success"]),
+        "api_error": bool(refine_result.get("api_error", False)),
+        "refiner_error": refine_result["error"],
+        "refiner_raw_response": refine_result["raw_refiner_response"]
+    }
+
+    if not refine_result["success"]:
+        is_api_error = bool(refine_result.get("api_error", False))
+        normalized = {
+            "passed": False,
+            "critique": "api error" if is_api_error else (
+                f"{normalized.get('critique', '')} | "
+                f"{refine_result['error']}"
+            ).strip(),
+            "scores": normalized.get("scores", {
+                "completeness": 1,
+                "consistency": 1,
+                "realism": 1
+            })
+        }
+        refiner_history.append(attempt_log)
+        return {
+            "synthetic_json_current": synthetic_json_current,
+            "refiner_attempts": refiner_attempts,
+            "normalized": normalized,
+            "refiner_history": refiner_history,
+            "stop_after_refiner_error": True,
+            "last_step_was_refiner": False,
+            "api_error": is_api_error,
+            "api_error_stage": str(refine_result.get("api_error_stage", "")),
+            "api_error_message": str(refine_result.get("api_error_message", refine_result["error"])),
+            "api_attempts": int(refine_result.get("api_attempts", 0))
+        }
+
+    refiner_history.append(attempt_log)
+    return {
+        "synthetic_json_current": synthetic_json_current,
+        "refiner_attempts": refiner_attempts,
+        "refiner_history": refiner_history,
+        "stop_after_refiner_error": False,
+        "last_step_was_refiner": True,
+        "api_error": False,
+        "api_error_stage": "",
+        "api_error_message": "",
+        "api_attempts": int(refine_result.get("api_attempts", 0))
+    }
+
+
+def Route_After_Refiner(state: RowJudgeRefinerState):
+    if bool(state.get("api_error", False)):
+        return END
+
+    if state.get("stop_after_refiner_error", False):
+        return END
+
+    return "judge"
+
+
+def Build_Row_Judge_Refiner_Graph():
+    workflow = StateGraph(RowJudgeRefinerState)
+
+    workflow.add_node("judge", Judge_Row_Node)
+    workflow.add_node("refiner", Refiner_Row_Node)
+
+    workflow.add_edge(START, "judge")
+    workflow.add_conditional_edges("judge", Route_After_Judge)
+    workflow.add_conditional_edges("refiner", Route_After_Refiner)
+
+    return workflow.compile()
 
 
 '''
@@ -241,9 +439,13 @@ def Run_Judge_Model(results_df, max_refiner_attempts=2):
     results_df["refiner_attempts"] = 0
     results_df["refiner_applied"] = False
     results_df["refiner_history"] = "[]"
+    results_df["api_error"] = False
+    results_df["api_error_stage"] = ""
+    results_df["api_error_message"] = ""
 
     evaluations = []
     total_rows = len(results_df)
+    row_judge_refiner_app = Build_Row_Judge_Refiner_Graph()
 
     for idx, row in results_df.iterrows():
         synthetic_json_current = row.get("new_synthetic_trade_json", "")
@@ -251,78 +453,58 @@ def Run_Judge_Model(results_df, max_refiner_attempts=2):
         target_ticker = str(row.get("ticker", ""))
         target_volatility = str(row.get("target_volatility", ""))
 
-        judge_result = Judge_One_Row(
-            synthetic_json_current,
-            few_shot_examples,
-            judge_url,
-            judge_model_id,
-            headers
-        )
+        row_state = {
+            "synthetic_json_current": synthetic_json_current,
+            "few_shot_examples": few_shot_examples,
+            "target_ticker": target_ticker,
+            "target_volatility": target_volatility,
+            "judge_url": judge_url,
+            "judge_model_id": judge_model_id,
+            "headers": headers,
+            "max_refiner_attempts": int(max_refiner_attempts),
+            "refiner_attempts": 0,
+            "refiner_history": [],
+            "stop_after_refiner_error": False,
+            "last_step_was_refiner": False,
+            "api_error": False,
+            "api_error_stage": "",
+            "api_error_message": "",
+            "api_attempts": 0
+        }
+        final_state = row_judge_refiner_app.invoke(row_state)
 
-        normalized = judge_result["judge"]
-        raw_judge_response = judge_result["judge_raw_response"]
-        clean_trade_json = judge_result["clean_trade_json"]
-        normalized_few_shot = judge_result["few_shot_examples"]
-
-        refiner_attempts = 0
-        refiner_history = []
-
-        while not normalized["passed"] and refiner_attempts < max_refiner_attempts:
-            refiner_attempts += 1
-            refine_result = Refiner_System.Refine_Trade_Row(
-                original_trade_json_raw=synthetic_json_current,
-                few_shot_examples=normalized_few_shot,
-                judge_critique=normalized["critique"],
-                target_ticker=target_ticker,
-                target_volatility=target_volatility
-            )
-
-            synthetic_json_current = refine_result["refined_json_text"]
-            attempt_log = {
-                "attempt": refiner_attempts,
-                "judge_critique_in": normalized["critique"],
-                "refiner_success": bool(refine_result["success"]),
-                "refiner_error": refine_result["error"],
-                "refiner_raw_response": refine_result["raw_refiner_response"]
+        synthetic_json_current = final_state.get("synthetic_json_current", synthetic_json_current)
+        normalized_few_shot = final_state.get("few_shot_examples", str(few_shot_examples or ""))
+        normalized = final_state.get("normalized", {
+            "passed": False,
+            "critique": "Judge graph did not return a normalized payload.",
+            "scores": {
+                "completeness": 1,
+                "consistency": 1,
+                "realism": 1
             }
-
-            if not refine_result["success"]:
-                normalized = {
-                    "passed": False,
-                    "critique": (
-                        f"{normalized['critique']} | "
-                        f"{refine_result['error']}"
-                    ),
-                    "scores": normalized["scores"]
-                }
-                refiner_history.append(attempt_log)
-                break
-
-            judge_result = Judge_One_Row(
-                synthetic_json_current,
-                normalized_few_shot,
-                judge_url,
-                judge_model_id,
-                headers
-            )
-            normalized = judge_result["judge"]
-            raw_judge_response = judge_result["judge_raw_response"]
-            clean_trade_json = judge_result["clean_trade_json"]
-
-            attempt_log["judge_after_refine"] = normalized
-            attempt_log["judge_raw_response_after_refine"] = raw_judge_response
-            refiner_history.append(attempt_log)
+        })
+        raw_judge_response = final_state.get("raw_judge_response", "")
+        clean_trade_json = final_state.get("clean_trade_json", "")
+        refiner_attempts = int(final_state.get("refiner_attempts", 0))
+        refiner_history = final_state.get("refiner_history", [])
+        api_error = bool(final_state.get("api_error", False))
+        api_error_stage = str(final_state.get("api_error_stage", ""))
+        api_error_message = str(final_state.get("api_error_message", ""))
 
         # Persist refined JSON back to the dataframe so downstream unpacking uses the final row.
         results_df.at[idx, "new_synthetic_trade_json"] = synthetic_json_current
         results_df.at[idx, "judge_passed"] = bool(normalized["passed"])
-        results_df.at[idx, "judge_critique"] = normalized["critique"]
+        results_df.at[idx, "judge_critique"] = "api error" if api_error else normalized["critique"]
         results_df.at[idx, "judge_completeness"] = normalized["scores"]["completeness"]
         results_df.at[idx, "judge_consistency"] = normalized["scores"]["consistency"]
         results_df.at[idx, "judge_realism"] = normalized["scores"]["realism"]
         results_df.at[idx, "refiner_attempts"] = int(refiner_attempts)
         results_df.at[idx, "refiner_applied"] = bool(refiner_attempts > 0)
         results_df.at[idx, "refiner_history"] = json.dumps(refiner_history, ensure_ascii=True)
+        results_df.at[idx, "api_error"] = bool(api_error)
+        results_df.at[idx, "api_error_stage"] = api_error_stage
+        results_df.at[idx, "api_error_message"] = api_error_message
 
         evaluations.append({
             "row_index": int(idx),
@@ -333,12 +515,15 @@ def Run_Judge_Model(results_df, max_refiner_attempts=2):
             "few_shot_examples": normalized_few_shot,
             "judge": normalized,
             "judge_raw_response": raw_judge_response,
-            "refiner_history": refiner_history
+            "refiner_history": refiner_history,
+            "api_error": bool(api_error),
+            "api_error_stage": api_error_stage,
+            "api_error_message": api_error_message
         })
 
         print(
             f"Judged row {idx + 1}/{total_rows} - "
-            f"passed={normalized['passed']} - refiner_attempts={refiner_attempts}",
+            f"passed={normalized['passed']} - refiner_attempts={refiner_attempts} - api_error={api_error}",
             end='\r'
         )
 
@@ -346,11 +531,13 @@ def Run_Judge_Model(results_df, max_refiner_attempts=2):
 
     passed_count = int(results_df["judge_passed"].sum())
     failed_count = int(total_rows - passed_count)
+    api_error_count = int(results_df["api_error"].sum()) if "api_error" in results_df.columns else 0
 
     summary = {
         "total_rows": total_rows,
         "passed_rows": passed_count,
-        "failed_rows": failed_count
+        "failed_rows": failed_count,
+        "api_error_rows": api_error_count
     }
 
     output_payload = {
